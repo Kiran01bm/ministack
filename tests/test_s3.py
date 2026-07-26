@@ -3650,3 +3650,60 @@ def test_s3_delete_delete_marker_by_version_id_restores_object(s3):
 
     markers = s3.list_object_versions(Bucket=bkt, Prefix="a").get("DeleteMarkers", [])
     assert markers == []
+
+
+def test_s3_get_object_attributes(s3):
+    import hashlib
+    bkt = f"intg-s3-attrs-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bkt)
+
+    # Single PUT (STANDARD): ETag has no quotes, StorageClass omitted, size echoed.
+    body = b"hello world"
+    s3.put_object(Bucket=bkt, Key="k1", Body=body)
+    r = s3.get_object_attributes(
+        Bucket=bkt, Key="k1", ObjectAttributes=["ETag", "ObjectSize", "StorageClass"])
+    assert r["ETag"] == hashlib.md5(body).hexdigest()  # no surrounding quotes
+    assert r["ObjectSize"] == len(body)
+    assert "StorageClass" not in r  # AWS omits StorageClass for S3 Standard
+
+    # Non-STANDARD storage class is reported.
+    s3.put_object(Bucket=bkt, Key="k2", Body=b"x", StorageClass="STANDARD_IA")
+    r = s3.get_object_attributes(Bucket=bkt, Key="k2", ObjectAttributes=["StorageClass"])
+    assert r["StorageClass"] == "STANDARD_IA"
+
+    # Checksum with its ChecksumType.
+    s3.put_object(Bucket=bkt, Key="k3", Body=b"abc", ChecksumAlgorithm="SHA256")
+    r = s3.get_object_attributes(Bucket=bkt, Key="k3", ObjectAttributes=["Checksum"])
+    assert "ChecksumSHA256" in r["Checksum"]
+    assert r["Checksum"]["ChecksumType"] == "FULL_OBJECT"
+
+    # Only requested attributes are returned.
+    r = s3.get_object_attributes(Bucket=bkt, Key="k1", ObjectAttributes=["ObjectSize"])
+    assert "ETag" not in r and r["ObjectSize"] == len(body)
+
+    # Multipart: ObjectParts lists the completed parts.
+    mp = s3.create_multipart_upload(Bucket=bkt, Key="k4")
+    uid = mp["UploadId"]
+    parts = []
+    for i in (1, 2):
+        p = s3.upload_part(Bucket=bkt, Key="k4", PartNumber=i, UploadId=uid,
+                           Body=b"z" * (5 * 1024 * 1024))
+        parts.append({"PartNumber": i, "ETag": p["ETag"]})
+    s3.complete_multipart_upload(Bucket=bkt, Key="k4", UploadId=uid,
+                                 MultipartUpload={"Parts": parts})
+    r = s3.get_object_attributes(Bucket=bkt, Key="k4", ObjectAttributes=["ObjectParts"])
+    assert r["ObjectParts"]["TotalPartsCount"] == 2
+    assert [p["PartNumber"] for p in r["ObjectParts"]["Parts"]] == [1, 2]
+
+    # Missing key → NoSuchKey.
+    with pytest.raises(ClientError) as exc:
+        s3.get_object_attributes(Bucket=bkt, Key="absent", ObjectAttributes=["ETag"])
+    assert exc.value.response["Error"]["Code"] == "NoSuchKey"
+
+    # Versioned read by versionId.
+    s3.put_bucket_versioning(Bucket=bkt,
+                             VersioningConfiguration={"Status": "Enabled"})
+    pv = s3.put_object(Bucket=bkt, Key="kv", Body=b"v1")
+    r = s3.get_object_attributes(Bucket=bkt, Key="kv", VersionId=pv["VersionId"],
+                                 ObjectAttributes=["ObjectSize"])
+    assert r["ObjectSize"] == 2 and r["VersionId"] == pv["VersionId"]

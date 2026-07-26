@@ -785,6 +785,8 @@ def _dispatch(
                 return _get_object_legal_hold(bucket, key)
             if "acl" in query_params:
                 return _get_object_acl(bucket, key)
+            if "attributes" in query_params:
+                return _get_object_attributes(bucket, key, headers, query_params)
             return _get_object(bucket, key, headers, query_params)
 
         if method == "PUT":
@@ -2663,6 +2665,110 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
     return 200, resp_headers, body
 
 
+def _append_object_parts(root: Element, record: dict, headers: dict) -> None:
+    """Emit the ObjectParts (ListParts) block. Multipart-completed objects carry
+    retained `parts`; single-PUT objects have no parts and list an empty page."""
+    op = SubElement(root, "ObjectParts")
+    try:
+        max_parts = int(headers.get("x-amz-max-parts", 1000))
+    except (TypeError, ValueError):
+        max_parts = 1000
+    try:
+        marker = int(headers.get("x-amz-part-number-marker", 0))
+    except (TypeError, ValueError):
+        marker = 0
+    SubElement(op, "PartNumberMarker").text = str(marker)
+    SubElement(op, "MaxParts").text = str(max_parts)
+
+    parts = record.get("parts") or []
+    after = [p for p in parts if p["PartNumber"] > marker]
+    page = after[:max_parts] if max_parts >= 0 else after
+    truncated = len(after) > len(page)
+    SubElement(op, "IsTruncated").text = "true" if truncated else "false"
+    SubElement(op, "NextPartNumberMarker").text = str(
+        page[-1]["PartNumber"] if page else 0)
+    for p in page:
+        pe = SubElement(op, "Part")
+        SubElement(pe, "PartNumber").text = str(p["PartNumber"])
+        SubElement(pe, "Size").text = str(p["Size"])
+    # TotalPartsCount is reported only for genuine multipart objects.
+    if parts:
+        SubElement(op, "PartsCount").text = str(len(parts))
+
+
+def _get_object_attributes(bucket_name: str, key: str, headers: dict,
+                           query_params: dict):
+    """S3 GetObjectAttributes — GET /{bucket}/{key}?attributes. Returns only the
+    root-level fields named in the required `x-amz-object-attributes` header."""
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+
+    raw_attrs = headers.get("x-amz-object-attributes")
+    if not raw_attrs:
+        return _error(
+            "InvalidRequest",
+            "The x-amz-object-attributes header is required for GetObjectAttributes.",
+            400, f"/{bucket_name}/{key}")
+    requested = {a.strip() for a in raw_attrs.split(",") if a.strip()}
+
+    resp_headers = {"Content-Type": "application/xml"}
+    version_id = _qp(query_params, "versionId", "")
+    if version_id:
+        record = None
+        for v in _object_versions.get((bucket_name, key), []):
+            if v["version_id"] == version_id:
+                record = {
+                    "etag": v["etag"],
+                    "size": v["size"],
+                    "last_modified": v["last_modified"],
+                    "storage_class": v.get("storage_class") or "STANDARD",
+                    "checksums": v.get("checksums") or {},
+                    "parts": v.get("parts"),
+                }
+                break
+        if record is None:
+            return _error("NoSuchVersion", "The specified version does not exist.",
+                          404, f"/{bucket_name}/{key}")
+        resp_headers["x-amz-version-id"] = version_id
+    else:
+        obj = bucket["objects"].get(key)
+        if obj is None:
+            return _error("NoSuchKey", "The specified key does not exist.",
+                          404, f"/{bucket_name}/{key}")
+        record = obj
+        if obj.get("version_id"):
+            resp_headers["x-amz-version-id"] = obj["version_id"]
+
+    resp_headers["Last-Modified"] = iso_to_rfc7231(record["last_modified"])
+
+    # Emit only requested attributes, in the AWS response order.
+    root = Element("GetObjectAttributesResponse", xmlns=S3_NS)
+    if "ETag" in requested:
+        # GetObjectAttributes returns the ETag WITHOUT the surrounding quotes
+        # that the ETag HTTP header carries on Get/HeadObject.
+        SubElement(root, "ETag").text = (record.get("etag") or "").strip('"')
+    if "Checksum" in requested:
+        checksums = record.get("checksums") or {}
+        cks = SubElement(root, "Checksum")
+        for alg, val in checksums.items():
+            SubElement(cks, f"Checksum{alg}").text = val
+        if checksums:
+            SubElement(cks, "ChecksumType").text = (
+                "COMPOSITE" if record.get("parts") else "FULL_OBJECT")
+    if "ObjectParts" in requested:
+        _append_object_parts(root, record, headers)
+    if "StorageClass" in requested:
+        sc = record.get("storage_class") or "STANDARD"
+        # AWS returns StorageClass for every class except S3 Standard.
+        if sc != "STANDARD":
+            SubElement(root, "StorageClass").text = sc
+    if "ObjectSize" in requested:
+        SubElement(root, "ObjectSize").text = str(record["size"])
+
+    return 200, resp_headers, _xml_body(root)
+
+
 def _range_error_xml(bucket_name: str, key: str) -> Element:
     root = Element("Error")
     SubElement(root, "Code").text = "InvalidRange"
@@ -4118,6 +4224,7 @@ def _complete_multipart_upload(
 
     md5_digests = b""
     combined = b""
+    part_records = []
     for pn, req_etag in ordered_parts:
         if pn not in upload["parts"]:
             return _error(
@@ -4135,6 +4242,9 @@ def _complete_multipart_upload(
             )
         md5_digests += hashlib.md5(stored["body"]).digest()
         combined += stored["body"]
+        # Retained so GetObjectAttributes can report ObjectParts (ListParts
+        # functionality) for the completed multipart object.
+        part_records.append({"PartNumber": pn, "Size": len(stored["body"])})
 
     final_md5 = hashlib.md5(md5_digests).hexdigest()
     final_etag = f'"{final_md5}-{len(ordered_parts)}"'
@@ -4149,6 +4259,7 @@ def _complete_multipart_upload(
         "metadata": upload["metadata"],
         "preserved_headers": upload.get("preserved_headers", {}),
         "storage_class": upload.get("storage_class") or "STANDARD",
+        "parts": part_records,
     }
     bucket["objects"][key] = obj
 
