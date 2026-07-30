@@ -7,6 +7,8 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- **EC2 - `ModifySecurityGroupRules`** - this action was unimplemented and returned `InvalidAction: Unknown EC2 action: ModifySecurityGroupRules`. Full support is now provided.
+
 ## [1.4.8] — 2026-07-28
 
 ### Added
