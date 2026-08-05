@@ -3,7 +3,7 @@ CloudWatch Logs Service Emulator.
 JSON-based API via X-Amz-Target (Logs_20140328).
 Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
           CreateLogStream, DeleteLogStream, DescribeLogStreams,
-          PutLogEvents, GetLogEvents, FilterLogEvents,
+          PutLogEvents, GetLogEvents, FilterLogEvents, GetLogRecord, StartLiveTail,
           PutRetentionPolicy, DeleteRetentionPolicy,
           PutSubscriptionFilter, DeleteSubscriptionFilter, DescribeSubscriptionFilters,
           TagLogGroup, UntagLogGroup, ListTagsLogGroup,
@@ -18,17 +18,22 @@ Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
 """
 
 import base64
+import contextlib
 import copy
 import fnmatch
 import json
 import logging
 import os
+import re
 import time
+import zlib
+from datetime import datetime, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
+    StreamingResponse,
     error_response_json,
     get_account_id,
     get_region,
@@ -62,7 +67,16 @@ _metric_filters = AccountRegionScopedDict()
 # (log_group_name, filter_name) -> {filterName, logGroupName, filterPattern, metricTransformations, creationTime}
 
 _queries = AccountRegionScopedDict()
-# query_id -> {queryId, logGroupName, startTime, endTime, queryString, status}
+# query_id -> {queryId, logGroupName, startTime, endTime, queryString, status,
+#              results, statistics}
+
+# Opaque Insights/GetLogRecord pointers → full transformed log record fields.
+# Keys are UUID strings assigned at PutLogEvents time (AWS-shaped: opaque).
+_log_records = AccountRegionScopedDict()
+# ptr -> {
+#   "@ptr", "@timestamp", "@message", "@logStream", "@log",
+#   "_timestamp_ms" (internal; stripped from GetLogRecord responses)
+# }
 
 _delivery_sources = AccountRegionScopedDict()
 # source_name -> {name, arn, resourceArns: [str], logType, service, tags}
@@ -76,6 +90,15 @@ _deliveries = AccountRegionScopedDict()
 #                 deliveryDestinationType, recordFields, fieldDelimiter,
 #                 s3DeliveryConfiguration, tags}
 
+# Active StartLiveTail sessions (not persisted). session_id -> session dict.
+# Populated while an ASGI stream is open; PutLogEvents fans matching events in.
+_live_tail_sessions: dict[str, dict] = {}
+
+# AWS Live Tail: one sessionUpdate per second (empty when idle), and at most
+# 10 buffered sessionUpdate events before the oldest is dropped.
+_LIVE_TAIL_IDLE_SECONDS = 1.0
+_LIVE_TAIL_QUEUE_MAX = 10
+
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -85,6 +108,7 @@ def get_state():
         "destinations": copy.deepcopy(_destinations),
         "metric_filters": copy.deepcopy(_metric_filters),
         "queries": copy.deepcopy(_queries),
+        "log_records": copy.deepcopy(_log_records),
         "delivery_sources": copy.deepcopy(_delivery_sources),
         "delivery_destinations": copy.deepcopy(_delivery_destinations),
         "deliveries": copy.deepcopy(_deliveries),
@@ -170,6 +194,7 @@ def restore_state(data):
         _destinations.update(data.get("destinations", {}))
         _restore_metric_filters(data.get("metric_filters", {}))
         _restore_queries(data.get("queries", {}))
+        _log_records.update(data.get("log_records", {}))
         _delivery_sources.update(data.get("delivery_sources", {}))
         _delivery_destinations.update(data.get("delivery_destinations", {}))
         _deliveries.update(data.get("deliveries", {}))
@@ -192,6 +217,11 @@ except Exception:
 
 def _make_group_arn(name):
     return f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{name}:*"
+
+
+def _make_group_arn_no_star(name):
+    """ARN form accepted by StartLiveTail (no trailing ``:*``)."""
+    return f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{name}"
 
 
 def _resolve_group_by_arn(arn):
@@ -262,6 +292,8 @@ async def handle_request(method, path, headers, body, query_params):
         "PutLogEvents": _put_log_events,
         "GetLogEvents": _get_log_events,
         "FilterLogEvents": _filter_log_events,
+        "GetLogRecord": _get_log_record,
+        "StartLiveTail": _start_live_tail,
         "PutRetentionPolicy": _put_retention_policy,
         "DeleteRetentionPolicy": _delete_retention_policy,
         "PutSubscriptionFilter": _put_subscription_filter,
@@ -334,6 +366,7 @@ def _delete_log_group(data):
             "ResourceNotFoundException",
             f"The specified log group does not exist: {name}", 400,
         )
+    _forget_log_records_for_group(name)
     del _log_groups[name]
     return json_response({})
 
@@ -366,6 +399,7 @@ def _describe_log_groups(data):
         entry = {
             "logGroupName": n,
             "arn": g["arn"],
+            "logGroupArn": _make_group_arn_no_star(n),
             "creationTime": g["creationTime"],
             "storedBytes": sum(
                 sum(len(e.get("message", "")) for e in s["events"])
@@ -429,6 +463,7 @@ def _delete_log_stream(data):
             "ResourceNotFoundException",
             f"The specified log stream does not exist: {stream}", 400,
         )
+    _forget_log_records_for_stream(group, stream)
     del _log_groups[group]["streams"][stream]
     return json_response({})
 
@@ -512,7 +547,20 @@ def _put_log_events(data):
     for e in events:
         ts = e.get("timestamp", now_ms)
         msg = e.get("message", "")
-        s["events"].append({"timestamp": ts, "message": msg, "ingestionTime": now_ms})
+        ptr = new_uuid()
+        s["events"].append({
+            "timestamp": ts,
+            "message": msg,
+            "ingestionTime": now_ms,
+            "eventId": ptr,
+        })
+        _log_records[ptr] = _build_log_record(
+            ptr=ptr,
+            timestamp_ms=ts,
+            message=msg,
+            log_group=group,
+            log_stream=stream,
+        )
 
         if s["firstEventTimestamp"] is None or ts < s["firstEventTimestamp"]:
             s["firstEventTimestamp"] = ts
@@ -524,7 +572,360 @@ def _put_log_events(data):
     s["uploadSequenceToken"] = token
 
     _fanout_to_subscription_filters(group, stream, events)
+    # Fan out the stored shape (ingestionTime filled) to any Live Tail sessions.
+    stored = s["events"][-len(events) :] if events else []
+    _fanout_to_live_tail_sessions(group, stream, stored)
     return json_response({"nextSequenceToken": token})
+
+
+def _format_insights_timestamp(timestamp_ms: int) -> str:
+    """AWS Logs Insights @timestamp string (UTC, millisecond precision)."""
+    dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
+
+
+def _build_log_record(*, ptr, timestamp_ms, message, log_group, log_stream):
+    return {
+        "@ptr": ptr,
+        "@timestamp": _format_insights_timestamp(timestamp_ms),
+        "@message": message,
+        "@logStream": log_stream,
+        "@log": log_group,
+        "_timestamp_ms": timestamp_ms,
+    }
+
+
+def _public_log_record(record: dict) -> dict:
+    """Strip MiniStack-internal fields before returning GetLogRecord payload."""
+    return {k: v for k, v in record.items() if not k.startswith("_")}
+
+
+def _forget_log_records_for_stream(group_name: str, stream_name: str) -> None:
+    to_delete = [
+        ptr
+        for ptr, record in list(_log_records.items())
+        if record.get("@log") == group_name and record.get("@logStream") == stream_name
+    ]
+    for ptr in to_delete:
+        del _log_records[ptr]
+
+
+def _forget_log_records_for_group(group_name: str) -> None:
+    to_delete = [
+        ptr for ptr, record in list(_log_records.items()) if record.get("@log") == group_name
+    ]
+    for ptr in to_delete:
+        del _log_records[ptr]
+
+
+def _get_log_record(data):
+    """Retrieve the full transformed field map for one Insights ``@ptr``.
+
+    AWS accepts ``unmask``; MiniStack does not implement field masking, so the
+    flag is accepted and ignored. Invalid/missing pointers raise
+    ``InvalidParameterException`` (AWS behavior).
+    """
+    ptr = data.get("logRecordPointer")
+    if not ptr:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value null at 'logRecordPointer' "
+            "failed to satisfy constraint: Member must not be null",
+            400,
+        )
+    # Accepted for SDK/AWS parity; masking is not implemented.
+    _ = data.get("unmask", False)
+
+    record = _log_records.get(ptr)
+    if not record:
+        return error_response_json(
+            "InvalidParameterException",
+            "Invalid logRecordPointer provided",
+            400,
+        )
+    return json_response({"logRecord": _public_log_record(record)})
+
+
+# ---------------------------------------------------------------------------
+# Live Tail (StartLiveTail eventstream)
+# ---------------------------------------------------------------------------
+
+def _es_encode_message(headers: dict[str, str], payload: bytes) -> bytes:
+    """Encode one ``application/vnd.amazon.eventstream`` message (AWS wire format)."""
+    hdr_bytes = bytearray()
+    for name, value in headers.items():
+        name_b = name.encode("utf-8")
+        val_b = value.encode("utf-8")
+        hdr_bytes.append(len(name_b))
+        hdr_bytes.extend(name_b)
+        hdr_bytes.append(7)  # string
+        hdr_bytes.extend(len(val_b).to_bytes(2, "big"))
+        hdr_bytes.extend(val_b)
+
+    headers_length = len(hdr_bytes)
+    total_length = 12 + headers_length + len(payload) + 4
+    prelude = total_length.to_bytes(4, "big") + headers_length.to_bytes(4, "big")
+    prelude_crc = zlib.crc32(prelude).to_bytes(4, "big")
+    msg_head = prelude + prelude_crc + bytes(hdr_bytes) + payload
+    message_crc = zlib.crc32(msg_head).to_bytes(4, "big")
+    return msg_head + message_crc
+
+
+def _es_event(event_type: str, payload: dict) -> bytes:
+    return _es_encode_message(
+        {
+            ":message-type": "event",
+            ":event-type": event_type,
+            ":content-type": "application/json",
+        },
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+    )
+
+
+def _resolve_live_tail_group_name(identifier: str) -> str | None:
+    """Resolve a StartLiveTail logGroupIdentifier (ARN without ``:*``, or bare name)."""
+    if not identifier:
+        return None
+    if identifier.startswith("arn:"):
+        if identifier.endswith(":*"):
+            return None  # AWS rejects trailing :* for Live Tail identifiers
+        return _log_group_name_from_identifier_arn(identifier) or _resolve_group_by_arn(identifier)
+    if identifier in _log_groups:
+        return identifier
+    return None
+
+
+def _live_tail_stream_allowed(stream_name: str, stream_names, stream_prefixes) -> bool:
+    if stream_names:
+        return stream_name in stream_names
+    if stream_prefixes:
+        return any(stream_name.startswith(prefix) for prefix in stream_prefixes)
+    return True
+
+
+def _fanout_to_live_tail_sessions(group_name: str, stream_name: str, events: list[dict]) -> None:
+    """Push matching PutLogEvents into active Live Tail session queues."""
+    import asyncio
+
+    if not events or not _live_tail_sessions:
+        return
+    account_id = get_account_id()
+    region = get_region()
+    for session in list(_live_tail_sessions.values()):
+        if session.get("account_id") != account_id or session.get("region") != region:
+            continue
+        if group_name not in session["group_names"]:
+            continue
+        if not _live_tail_stream_allowed(
+            stream_name, session.get("stream_names"), session.get("stream_prefixes")
+        ):
+            continue
+        identifier = session["identifiers_by_name"][group_name]
+        filter_pattern = session.get("filter_pattern") or ""
+        matched = []
+        for event in events:
+            message = event.get("message", "")
+            if not _subscription_pattern_matches(filter_pattern, message):
+                continue
+            matched.append(
+                {
+                    "logStreamName": stream_name,
+                    "logGroupIdentifier": identifier,
+                    "message": message,
+                    "timestamp": event.get("timestamp"),
+                    "ingestionTime": event.get("ingestionTime"),
+                }
+            )
+        if not matched:
+            continue
+        queue = session["queue"]
+        item = (matched, False)
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            # AWS keeps at most 10 LiveTailSessionUpdate events; drop oldest.
+            session["sampled"] = True
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait((matched, True))
+
+
+async def _await_http_disconnect(receive) -> None:
+    while True:
+        message = await receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
+def _start_live_tail(data):
+    """Start a Live Tail session.
+
+    Holds the HTTP eventstream open until the client disconnects. Matching
+    ``PutLogEvents`` calls fan into ``sessionUpdate`` frames via an asyncio
+    queue (same pattern as API Gateway WebSocket outboxes). Idle empty
+    ``sessionUpdate`` frames are emitted once per second (AWS cadence). At most
+    10 updates are buffered; overflow drops the oldest and sets ``sampled``.
+    """
+    import asyncio
+
+    identifiers = data.get("logGroupIdentifiers") or []
+    if not identifiers:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value null at 'logGroupIdentifiers' "
+            "failed to satisfy constraint: Member must not be null",
+            400,
+        )
+    if len(identifiers) > 10:
+        return error_response_json(
+            "InvalidParameterException",
+            "logGroupIdentifiers may contain at most 10 items",
+            400,
+        )
+
+    stream_names = data.get("logStreamNames") or None
+    stream_prefixes = data.get("logStreamNamePrefixes") or None
+    if stream_names and stream_prefixes:
+        return error_response_json(
+            "InvalidParameterException",
+            "logStreamNames and logStreamNamePrefixes are mutually exclusive",
+            400,
+        )
+    if (stream_names or stream_prefixes) and len(identifiers) != 1:
+        return error_response_json(
+            "InvalidParameterException",
+            "logStreamNames/logStreamNamePrefixes require exactly one log group",
+            400,
+        )
+
+    resolved_names: list[str] = []
+    identifiers_by_name: dict[str, str] = {}
+    for identifier in identifiers:
+        name = _resolve_live_tail_group_name(identifier)
+        if not name or name not in _log_groups:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"The specified log group does not exist: {identifier}",
+                400,
+            )
+        if name not in resolved_names:
+            resolved_names.append(name)
+            identifiers_by_name[name] = (
+                identifier if identifier.startswith("arn:") else _make_group_arn_no_star(name)
+            )
+
+    filter_pattern = data.get("logEventFilterPattern") or ""
+    request_id = new_uuid()
+    session_id = new_uuid()
+    start_payload = {
+        "requestId": request_id,
+        "sessionId": session_id,
+        "logGroupIdentifiers": [identifiers_by_name[n] for n in resolved_names],
+    }
+    if stream_names:
+        start_payload["logStreamNames"] = list(stream_names)
+    if stream_prefixes:
+        start_payload["logStreamNamePrefixes"] = list(stream_prefixes)
+    if filter_pattern:
+        start_payload["logEventFilterPattern"] = filter_pattern
+
+    account_id = get_account_id()
+    region = get_region()
+
+    initial_bytes = _es_encode_message(
+        {
+            ":message-type": "event",
+            ":event-type": "initial-response",
+            ":content-type": "application/json",
+        },
+        b"{}",
+    )
+    start_bytes = _es_event("sessionStart", start_payload)
+
+    async def _run(send, receive):
+        async def _send_chunk(payload: bytes, *, more: bool = True) -> None:
+            await send({"type": "http.response.body", "body": payload, "more_body": more})
+
+        # Register before the first await so concurrent PutLogEvents cannot race
+        # past sessionStart into a missing session.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_LIVE_TAIL_QUEUE_MAX)
+        session = {
+            "session_id": session_id,
+            "account_id": account_id,
+            "region": region,
+            "group_names": set(resolved_names),
+            "identifiers_by_name": identifiers_by_name,
+            "stream_names": list(stream_names) if stream_names else None,
+            "stream_prefixes": list(stream_prefixes) if stream_prefixes else None,
+            "filter_pattern": filter_pattern,
+            "queue": queue,
+            "sampled": False,
+        }
+        _live_tail_sessions[session_id] = session
+
+        await _send_chunk(initial_bytes)
+        await _send_chunk(start_bytes)
+
+        disconnect_task = asyncio.create_task(_await_http_disconnect(receive))
+        try:
+            while not disconnect_task.done():
+                get_task = asyncio.create_task(queue.get())
+                done, _pending = await asyncio.wait(
+                    {get_task, disconnect_task},
+                    timeout=_LIVE_TAIL_IDLE_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if disconnect_task in done:
+                    get_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await get_task
+                    break
+                if get_task in done:
+                    item = get_task.result()
+                    if item is None:
+                        break
+                    results, sampled_flag = item
+                    sampled = bool(sampled_flag or session.get("sampled"))
+                    session["sampled"] = False
+                    await _send_chunk(
+                        _es_event(
+                            "sessionUpdate",
+                            {
+                                "sessionMetadata": {"sampled": sampled},
+                                "sessionResults": results,
+                            },
+                        )
+                    )
+                else:
+                    get_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await get_task
+                    await _send_chunk(
+                        _es_event(
+                            "sessionUpdate",
+                            {
+                                "sessionMetadata": {"sampled": False},
+                                "sessionResults": [],
+                            },
+                        )
+                    )
+        finally:
+            _live_tail_sessions.pop(session_id, None)
+            disconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await disconnect_task
+            with contextlib.suppress(Exception):
+                await _send_chunk(b"", more=False)
+
+    return (
+        200,
+        {
+            "Content-Type": "application/vnd.amazon.eventstream",
+            "x-amzn-RequestId": request_id,
+        },
+        StreamingResponse(_run),
+    )
 
 
 def _subscription_pattern_matches(pattern, message):
@@ -1065,19 +1466,307 @@ def _describe_metric_filters(data):
 
 
 # ---------------------------------------------------------------------------
-# CloudWatch Logs Insights (stubs)
+# CloudWatch Logs Insights
 # ---------------------------------------------------------------------------
 
+def _split_insights_pipes(query_string: str) -> list[str]:
+    """Split a CWLI query on ``|`` outside quotes and ``/regex/`` literals."""
+    text = query_string or ""
+    parts: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "|":
+            parts.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                buf.append(c)
+                if c == "\\" and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if c == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "/":
+            buf.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                buf.append(c)
+                if c == "\\" and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if c == "/":
+                    i += 1
+                    # optional flags (e.g. i)
+                    while i < n and text[i].isalpha():
+                        buf.append(text[i])
+                        i += 1
+                    break
+                i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf).strip())
+    return [p for p in parts if p]
+
+
+def _parse_insights_fields(query_string: str) -> list[str]:
+    """Extract field names from a simple ``fields a, b | ...`` Insights query.
+
+    Falls back to the CWLT/default set when the query has no fields clause.
+    Supports a CWLI subset: ``fields``, ``filter``, ``sort @timestamp``, ``limit``.
+    """
+    for stage in _split_insights_pipes(query_string):
+        match = re.match(r"(?i)^fields\s+(.+)$", stage.strip())
+        if match:
+            fields = [part.strip() for part in match.group(1).split(",") if part.strip()]
+            if "@ptr" not in fields:
+                fields.append("@ptr")
+            return fields
+    return ["@timestamp", "@message", "@logStream", "@log", "@ptr"]
+
+
+def _clamp_insights_limit(value) -> int | None:
+    try:
+        return max(1, min(int(value), 10000))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_insights_limit(query_string: str, explicit_limit) -> int:
+    """Effective Insights limit: ``min(query | limit, StartQuery limit)``.
+
+    Both sides default to 10000 when omitted. The query-string limit must apply
+    to the post-filter result set and must not be bypassed by a large API limit.
+    """
+    pipe_limit = None
+    for stage in _split_insights_pipes(query_string):
+        match = re.match(r"(?i)^limit\s+(\d+)\s*$", stage.strip())
+        if match:
+            pipe_limit = _clamp_insights_limit(match.group(1))
+    api_limit = _clamp_insights_limit(explicit_limit) if explicit_limit is not None else None
+    if pipe_limit is None and api_limit is None:
+        return 10000
+    if pipe_limit is None:
+        return api_limit
+    if api_limit is None:
+        return pipe_limit
+    return min(pipe_limit, api_limit)
+
+
+def _compile_insights_filter(stage: str):
+    """Compile one ``filter`` stage into a predicate ``record -> bool``.
+
+    Supported forms:
+    - ``filter @logStream = 'exact'``
+    - ``filter @message like /pattern/`` or ``/pattern/i``
+    """
+    text = stage.strip()
+    if not re.match(r"(?i)^filter\b", text):
+        return None
+    body = re.sub(r"(?i)^filter\s+", "", text, count=1).strip()
+
+    eq = re.match(r"^(@\w+)\s*=\s*'((?:\\'|[^'])*)'\s*$", body)
+    if eq:
+        field, raw = eq.group(1), eq.group(2).replace("\\'", "'")
+
+        def _eq_pred(record, _field=field, _raw=raw):
+            public = _public_log_record(record)
+            return str(public.get(_field, "")) == _raw
+
+        return _eq_pred
+
+    like = re.match(r"^(@\w+)\s+like\s+/((?:\\.|[^/])*)/([i]*)\s*$", body, re.IGNORECASE)
+    if like:
+        field, pattern, flags_s = like.group(1), like.group(2), like.group(3)
+        flags = re.IGNORECASE if "i" in (flags_s or "").lower() else 0
+        try:
+            compiled = re.compile(pattern, flags)
+        except re.error:
+            return lambda _record: False
+
+        def _like_pred(record, _field=field, _compiled=compiled):
+            public = _public_log_record(record)
+            return _compiled.search(str(public.get(_field, ""))) is not None
+
+        return _like_pred
+
+    # Unsupported filter form — ignore (subset emulator).
+    return None
+
+
+def _parse_insights_sort(query_string: str) -> tuple[str, bool] | None:
+    """Return ``(field, ascending)`` for ``sort @timestamp [asc|desc]``, else None."""
+    for stage in _split_insights_pipes(query_string):
+        match = re.match(
+            r"(?i)^sort\s+(@\w+)(?:\s+(asc|desc))?\s*$",
+            stage.strip(),
+        )
+        if match:
+            field = match.group(1)
+            direction = (match.group(2) or "asc").lower()
+            return field, direction != "desc"
+    return None
+
+
+def _insights_filter_predicates(query_string: str) -> list:
+    preds = []
+    for stage in _split_insights_pipes(query_string):
+        if not re.match(r"(?i)^filter\b", stage.strip()):
+            continue
+        pred = _compile_insights_filter(stage)
+        if pred is not None:
+            preds.append(pred)
+    return preds
+
+
+def _apply_insights_sort(records: list[dict], query_string: str) -> list[dict]:
+    sort_spec = _parse_insights_sort(query_string)
+    if not sort_spec:
+        return records
+    field, ascending = sort_spec
+    if field == "@timestamp":
+        return sorted(
+            records,
+            key=lambda r: r.get("_timestamp_ms", 0),
+            reverse=not ascending,
+        )
+    return sorted(
+        records,
+        key=lambda r: str(_public_log_record(r).get(field, "")),
+        reverse=not ascending,
+    )
+
+
+def _resolve_query_log_groups(data) -> list[str]:
+    groups: list[str] = []
+    if data.get("logGroupName"):
+        groups.append(data["logGroupName"])
+    for name in data.get("logGroupNames") or []:
+        if name and name not in groups:
+            groups.append(name)
+    for identifier in data.get("logGroupIdentifiers") or []:
+        # Accept plain names or ARNs (...:log-group:NAME[:*]).
+        name = identifier
+        if ":log-group:" in identifier:
+            name = identifier.split(":log-group:", 1)[1]
+            if name.endswith(":*"):
+                name = name[:-2]
+            elif ":" in name:
+                name = name.split(":", 1)[0]
+        if name and name not in groups:
+            groups.append(name)
+    return groups
+
+
+def _collect_query_records(group_names, start_time_s, end_time_s):
+    """Collect stored log records in [start, end] (epoch seconds, AWS Insights)."""
+    start_ms = int(start_time_s) * 1000
+    end_ms = int(end_time_s) * 1000
+    collected = []
+    for group_name in group_names:
+        group = _log_groups.get(group_name)
+        if not group:
+            continue
+        for stream_name, stream in group.get("streams", {}).items():
+            for event in stream.get("events", []):
+                ts = event.get("timestamp", 0)
+                if ts < start_ms or ts > end_ms:
+                    continue
+                ptr = event.get("eventId")
+                record = _log_records.get(ptr) if ptr else None
+                if not record:
+                    # Rebuild for events ingested before ptr indexing existed.
+                    ptr = ptr or new_uuid()
+                    record = _build_log_record(
+                        ptr=ptr,
+                        timestamp_ms=ts,
+                        message=event.get("message", ""),
+                        log_group=group_name,
+                        log_stream=stream_name,
+                    )
+                    _log_records[ptr] = record
+                    event["eventId"] = ptr
+                collected.append(record)
+    collected.sort(key=lambda r: r.get("_timestamp_ms", 0))
+    return collected
+
+
+def _row_from_record(record: dict, fields: list[str]) -> list[dict]:
+    public = _public_log_record(record)
+    return [{"field": field, "value": str(public.get(field, ""))} for field in fields]
+
+
 def _start_query(data):
+    """Run a CloudWatch Logs Insights query (CWLI subset).
+
+    Supported: ``fields``, chained ``filter`` (``@field = '…'``,
+    ``@field like /regex/[i]``), ``sort @timestamp asc|desc``, and ``limit``.
+    Filters are AND-ed; ``limit`` applies after filter+sort as
+    ``min(query limit, StartQuery limit)``.
+    """
+    group_names = _resolve_query_log_groups(data)
+    if not group_names:
+        return error_response_json(
+            "InvalidParameterException",
+            "logGroupName, logGroupNames, or logGroupIdentifiers is required",
+            400,
+        )
+    for name in group_names:
+        if name not in _log_groups:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"The specified log group does not exist: {name}",
+                400,
+            )
+
+    query_string = data.get("queryString", "")
+    fields = _parse_insights_fields(query_string)
+    limit = _parse_insights_limit(query_string, data.get("limit"))
+    start_time = data.get("startTime", 0)
+    end_time = data.get("endTime", int(time.time()))
+
+    scanned = _collect_query_records(group_names, start_time, end_time)
+    predicates = _insights_filter_predicates(query_string)
+    if predicates:
+        filtered = [r for r in scanned if all(pred(r) for pred in predicates)]
+    else:
+        filtered = list(scanned)
+    ordered = _apply_insights_sort(filtered, query_string)
+    limited = ordered[:limit]
+    results = [_row_from_record(record, fields) for record in limited]
+    bytes_scanned = float(sum(len(r.get("@message", "")) for r in scanned))
+
     query_id = new_uuid()
     _queries[query_id] = {
         "queryId": query_id,
         "logGroupName": data.get("logGroupName", ""),
         "logGroupNames": data.get("logGroupNames", []),
-        "startTime": data.get("startTime", 0),
-        "endTime": data.get("endTime", 0),
-        "queryString": data.get("queryString", ""),
+        "logGroupIdentifiers": data.get("logGroupIdentifiers", []),
+        "startTime": start_time,
+        "endTime": end_time,
+        "queryString": query_string,
         "status": "Complete",
+        "results": results,
+        "statistics": {
+            "recordsMatched": float(len(filtered)),
+            "recordsScanned": float(len(scanned)),
+            "bytesScanned": bytes_scanned,
+        },
     }
     return json_response({"queryId": query_id})
 
@@ -1092,8 +1781,11 @@ def _get_query_results(data):
         )
     return json_response({
         "status": query["status"],
-        "results": [],
-        "statistics": {"recordsMatched": 0.0, "recordsScanned": 0.0, "bytesScanned": 0.0},
+        "results": query.get("results", []),
+        "statistics": query.get(
+            "statistics",
+            {"recordsMatched": 0.0, "recordsScanned": 0.0, "bytesScanned": 0.0},
+        ),
     })
 
 
@@ -1109,9 +1801,17 @@ def reset():
     _destinations.clear()
     _metric_filters.clear()
     _queries.clear()
+    _log_records.clear()
     _delivery_sources.clear()
     _delivery_destinations.clear()
     _deliveries.clear()
+    # Wake any held Live Tail streams so they exit on reset.
+    for session in list(_live_tail_sessions.values()):
+        queue = session.get("queue")
+        if queue is not None:
+            with contextlib.suppress(Exception):
+                queue.put_nowait(None)
+    _live_tail_sessions.clear()
 
 
 # ---------------------------------------------------------------------------

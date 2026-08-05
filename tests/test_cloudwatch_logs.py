@@ -321,6 +321,245 @@ def test_logs_insights_start_query(logs):
     results = logs.get_query_results(queryId=resp["queryId"])
     assert results["status"] in ("Complete", "Running", "Scheduled")
 
+
+def test_logs_get_log_record_round_trip(logs):
+    """PutLogEvents assigns opaque @ptr; Insights returns it; GetLogRecord resolves fields."""
+    import uuid as _uuid
+
+    group = f"/intg/get-log-record/{_uuid.uuid4().hex[:8]}"
+    stream = "stream-a"
+    now_ms = int(time.time() * 1000)
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream)
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream,
+        logEvents=[
+            {"timestamp": now_ms - 1000, "message": "before"},
+            {"timestamp": now_ms, "message": '{"log":"anchor-row"}'},
+            {"timestamp": now_ms + 1000, "message": "after"},
+        ],
+    )
+
+    query = logs.start_query(
+        logGroupName=group,
+        startTime=(now_ms // 1000) - 60,
+        endTime=(now_ms // 1000) + 60,
+        queryString="fields @timestamp, @message, @logStream, @log | sort @timestamp asc | limit 10",
+        limit=10,
+    )
+    results = logs.get_query_results(queryId=query["queryId"])
+    assert results["status"] == "Complete"
+    assert len(results["results"]) == 3
+
+    def fields_map(row):
+        return {cell["field"]: cell["value"] for cell in row}
+
+    rows = [fields_map(row) for row in results["results"]]
+    assert all("@ptr" in row and row["@ptr"] for row in rows)
+    assert rows[1]["@message"] == '{"log":"anchor-row"}'
+    assert rows[1]["@logStream"] == stream
+    assert rows[1]["@log"] == group
+
+    record = logs.get_log_record(logRecordPointer=rows[1]["@ptr"], unmask=False)["logRecord"]
+    assert record["@message"] == '{"log":"anchor-row"}'
+    assert record["@logStream"] == stream
+    assert record["@ptr"] == rows[1]["@ptr"]
+    assert "_timestamp_ms" not in record
+
+
+def test_logs_insights_filter_sort_limit(logs):
+    """CWLI filter/sort/limit: stream equality, like regex, AND, sort, post-filter limit."""
+    import uuid as _uuid
+
+    group = f"/intg/insights-filter/{_uuid.uuid4().hex[:8]}"
+    stream_a = "nerv-deployment-aaa"
+    stream_b = "mbir-deployment-5d66976c69-p8qr6"
+    now_ms = int(time.time() * 1000)
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream_a)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream_b)
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream_a,
+        logEvents=[
+            {"timestamp": now_ms - 4000, "message": "nerv has a link too"},
+            {"timestamp": now_ms - 3000, "message": "nerv other"},
+        ],
+    )
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream_b,
+        logEvents=[
+            {"timestamp": now_ms - 2000, "message": "first link event"},
+            {"timestamp": now_ms - 1000, "message": "no match here"},
+            {"timestamp": now_ms, "message": "second link event"},
+            {"timestamp": now_ms + 1000, "message": "third link event"},
+        ],
+    )
+
+    def fields_map(row):
+        return {cell["field"]: cell["value"] for cell in row}
+
+    # @logStream equality
+    q1 = logs.start_query(
+        logGroupName=group,
+        startTime=(now_ms // 1000) - 60,
+        endTime=(now_ms // 1000) + 60,
+        queryString=(
+            f"fields @timestamp, @message, @logStream "
+            f"| filter @logStream = '{stream_b}' "
+            f"| sort @timestamp asc | limit 20"
+        ),
+        limit=1000,
+    )
+    r1 = logs.get_query_results(queryId=q1["queryId"])
+    assert r1["status"] == "Complete"
+    rows1 = [fields_map(row) for row in r1["results"]]
+    assert len(rows1) == 4
+    assert all(row["@logStream"] == stream_b for row in rows1)
+    assert r1["statistics"]["recordsScanned"] == 6.0
+    assert r1["statistics"]["recordsMatched"] == 4.0
+
+    # @message like /link/
+    q2 = logs.start_query(
+        logGroupName=group,
+        startTime=(now_ms // 1000) - 60,
+        endTime=(now_ms // 1000) + 60,
+        queryString=(
+            "fields @timestamp, @message, @logStream "
+            "| filter @message like /link/ "
+            "| sort @timestamp asc | limit 20"
+        ),
+        limit=1000,
+    )
+    r2 = logs.get_query_results(queryId=q2["queryId"])
+    rows2 = [fields_map(row) for row in r2["results"]]
+    assert len(rows2) == 4  # nerv link + 3 mbir links
+    assert all("link" in row["@message"] for row in rows2)
+
+    # AND filters + sort + query limit vs large API limit
+    q3 = logs.start_query(
+        logGroupName=group,
+        startTime=(now_ms // 1000) - 60,
+        endTime=(now_ms // 1000) + 60,
+        queryString=(
+            f"fields @timestamp, @message, @logStream "
+            f"| filter @logStream = '{stream_b}' "
+            f"| filter @message like /link/ "
+            f"| sort @timestamp asc | limit 2"
+        ),
+        limit=1000,
+    )
+    r3 = logs.get_query_results(queryId=q3["queryId"])
+    rows3 = [fields_map(row) for row in r3["results"]]
+    assert len(rows3) == 2
+    assert all(row["@logStream"] == stream_b for row in rows3)
+    assert all("link" in row["@message"] for row in rows3)
+    assert rows3[0]["@message"] == "first link event"
+    assert rows3[1]["@message"] == "second link event"
+    assert r3["statistics"]["recordsMatched"] == 3.0
+    assert r3["statistics"]["recordsScanned"] == 6.0
+
+
+def test_logs_get_log_record_invalid_pointer(logs):
+    with pytest.raises(ClientError) as exc:
+        logs.get_log_record(logRecordPointer="does-not-exist", unmask=False)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_logs_describe_includes_log_group_arn_without_star(logs):
+    import uuid as _uuid
+
+    group = f"/intg/log-group-arn/{_uuid.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=group)
+    described = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]
+    assert described["arn"].endswith(":*")
+    assert described["logGroupArn"] == described["arn"].removesuffix(":*")
+    assert ":*" not in described["logGroupArn"].split("log-group:")[-1]
+
+
+def test_logs_start_live_tail_receives_put_events(logs):
+    """StartLiveTail stays open and receives matching PutLogEvents until disconnect."""
+    import threading
+    import uuid as _uuid
+
+    group = f"/intg/live-tail/{_uuid.uuid4().hex[:8]}"
+    stream = "app/stream-1"
+    logs.create_log_group(logGroupName=group)
+    logs.create_log_stream(logGroupName=group, logStreamName=stream)
+    arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["logGroupArn"]
+
+    started = threading.Event()
+    got_events = threading.Event()
+    errors: list[BaseException] = []
+    seen: list[str] = []
+    stream_holder: dict = {}
+
+    def _tail():
+        try:
+            response = logs.start_live_tail(
+                logGroupIdentifiers=[arn],
+                logEventFilterPattern="ERROR",
+            )
+            event_stream = response["responseStream"]
+            stream_holder["stream"] = event_stream
+            started.set()
+            for event in event_stream:
+                if "sessionStart" in event:
+                    assert event["sessionStart"]["sessionId"]
+                    assert arn in event["sessionStart"]["logGroupIdentifiers"]
+                    continue
+                if "sessionUpdate" not in event:
+                    continue
+                for item in event["sessionUpdate"].get("sessionResults") or []:
+                    seen.append(item["message"])
+                    assert item["logStreamName"] == stream
+                    assert item["logGroupIdentifier"] == arn
+                if "ERROR boom" in seen and "ERROR again" in seen:
+                    got_events.set()
+                    break
+        except BaseException as exc:  # noqa: BLE001 — surface to main thread
+            errors.append(exc)
+            started.set()
+            got_events.set()
+
+    worker = threading.Thread(target=_tail, daemon=True)
+    worker.start()
+    assert started.wait(10), f"StartLiveTail did not start: {errors}"
+    time.sleep(0.3)  # allow session registration on the server
+
+    now_ms = int(time.time() * 1000)
+    logs.put_log_events(
+        logGroupName=group,
+        logStreamName=stream,
+        logEvents=[
+            {"timestamp": now_ms - 2000, "message": "INFO ok"},
+            {"timestamp": now_ms - 1000, "message": "ERROR boom"},
+            {"timestamp": now_ms, "message": "ERROR again"},
+        ],
+    )
+    assert got_events.wait(10), f"timed out waiting for Live Tail events; seen={seen} errors={errors}"
+    assert not errors, errors
+    assert seen == ["ERROR boom", "ERROR again"]
+
+    event_stream = stream_holder.get("stream")
+    if event_stream is not None:
+        event_stream.close()
+    worker.join(timeout=5)
+
+
+def test_logs_start_live_tail_rejects_star_arn(logs):
+    import uuid as _uuid
+
+    group = f"/intg/live-tail-star/{_uuid.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=group)
+    starred = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["arn"]
+    with pytest.raises(ClientError) as exc:
+        logs.start_live_tail(logGroupIdentifiers=[starred])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_logs_filter_with_wildcard(logs):
     """FilterLogEvents with wildcard pattern matches correctly."""
     logs.create_log_group(logGroupName="/qa/logs/wildcard")
@@ -904,6 +1143,67 @@ def _module():
     return importlib.import_module("ministack.services.cloudwatch_logs")
 
 
+def test_get_log_record_inprocess_round_trip():
+    """Handler-level coverage without a running gateway (CI-friendly)."""
+    import json as _json
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+
+    mod = _module()
+    mod.reset()
+    set_request_account_id("test")
+    set_request_region("us-east-1")
+
+    group = "/aws/lambda/get-log-record-unit"
+    stream = "stream-a"
+    now_ms = 1_700_000_000_000
+
+    assert mod._create_log_group({"logGroupName": group})[0] == 200
+    assert mod._create_log_stream({"logGroupName": group, "logStreamName": stream})[0] == 200
+    put = mod._put_log_events({
+        "logGroupName": group,
+        "logStreamName": stream,
+        "logEvents": [
+            {"timestamp": now_ms - 1000, "message": "before"},
+            {"timestamp": now_ms, "message": "anchor"},
+            {"timestamp": now_ms + 1000, "message": "after"},
+        ],
+    })
+    assert put[0] == 200
+
+    start = mod._start_query({
+        "logGroupName": group,
+        "startTime": (now_ms // 1000) - 10,
+        "endTime": (now_ms // 1000) + 10,
+        "queryString": "fields @timestamp, @message, @logStream, @log | limit 10",
+        "limit": 10,
+    })
+    assert start[0] == 200
+    query_id = _json.loads(start[2])["queryId"]
+
+    results = mod._get_query_results({"queryId": query_id})
+    assert results[0] == 200
+    body = _json.loads(results[2])
+    assert body["status"] == "Complete"
+    assert len(body["results"]) == 3
+    middle = {cell["field"]: cell["value"] for cell in body["results"][1]}
+    assert middle["@message"] == "anchor"
+    ptr = middle["@ptr"]
+
+    record_resp = mod._get_log_record({"logRecordPointer": ptr, "unmask": False})
+    assert record_resp[0] == 200
+    record = _json.loads(record_resp[2])["logRecord"]
+    assert record["@message"] == "anchor"
+    assert record["@logStream"] == stream
+    assert record["@log"] == group
+    assert "_timestamp_ms" not in record
+
+    bad = mod._get_log_record({"logRecordPointer": "missing"})
+    assert bad[0] == 400
+    assert _json.loads(bad[2])["__type"] == "InvalidParameterException"
+    mod.reset()
+
+
 @pytest.fixture(autouse=True)
 def _enable_persistence(monkeypatch, tmp_path):
     """Force PERSIST_STATE on and point STATE_DIR at a tmp dir for the
@@ -1065,6 +1365,7 @@ def test_queries_are_region_scoped():
 
     try:
         set_request_region("us-east-1")
+        assert mod._create_log_group({"logGroupName": "/aws/lambda/query-east"})[0] == 200
         east = mod._start_query({
             "logGroupName": "/aws/lambda/query-east",
             "startTime": 1,
@@ -1074,6 +1375,7 @@ def test_queries_are_region_scoped():
         east_id = json.loads(east[2])["queryId"]
 
         set_request_region("us-west-2")
+        assert mod._create_log_group({"logGroupName": "/aws/lambda/query-west"})[0] == 200
         west = mod._start_query({
             "logGroupName": "/aws/lambda/query-west",
             "startTime": 1,
