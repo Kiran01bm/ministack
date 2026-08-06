@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **RDS — Aurora PostgreSQL engine versions are validated at create time** — `CreateDBCluster` / `CreateDBInstance` accepted any `EngineVersion` string for `aurora-postgresql` and only failed later when the derived Docker image tag turned out wrong or missing at first-instance launch. An unknown version (anything `DescribeDBEngineVersions` doesn't advertise) now fails immediately with `InvalidParameterCombination` / `Cannot find version {version} for aurora-postgresql`, matching real AWS and the existing aurora-mysql behavior. The advertised version list is now a single shared constant used by both the catalog and the validator. Contributed by @kiran01bm.
+
 ## [1.4.13] — 2026-08-06
 
 ### Fixed

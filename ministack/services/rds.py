@@ -142,6 +142,21 @@ AURORA_MYSQL_ENGINE_VERSIONS = [
 ]
 AURORA_MYSQL_ENGINE_VERSION_SET = {version for version, _ in AURORA_MYSQL_ENGINE_VERSIONS}
 
+# Aurora PostgreSQL versions are the set DescribeDBEngineVersions advertises
+# (single source of truth for both the catalog and create-time validation).
+# Refresh with:
+#   aws rds describe-db-engine-versions --engine aurora-postgresql \
+#     --query 'DBEngineVersions[].[EngineVersion,DBParameterGroupFamily]' \
+#     --output text | sort -V
+AURORA_POSTGRESQL_ENGINE_VERSIONS = [
+    ("18.3", "aurora-postgresql18"), ("17.5", "aurora-postgresql17"),
+    ("16.4", "aurora-postgresql16"),
+    ("15.3", "aurora-postgresql15"), ("14.8", "aurora-postgresql14"),
+]
+AURORA_POSTGRESQL_ENGINE_VERSION_SET = {
+    version for version, _ in AURORA_POSTGRESQL_ENGINE_VERSIONS
+}
+
 AURORA_MYSQL_IMAGE_MAP = {
     "5.6": "mysql:5.6",
     "5.7": "mysql:5.7",
@@ -2380,7 +2395,7 @@ def _create_db_instance(p):
 
     engine = _p(p, "Engine") or "postgres"
     explicit_engine_version = _p(p, "EngineVersion")
-    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, explicit_engine_version)
+    engine_version_error = _unsupported_aurora_engine_version_error(engine, explicit_engine_version)
     if engine_version_error:
         return engine_version_error
     engine_version = explicit_engine_version or _default_engine_version(engine)
@@ -3322,7 +3337,7 @@ def _create_db_cluster(p):
             )
         engine = expected_engine or engine
     explicit_engine_version = _p(p, "EngineVersion")
-    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, explicit_engine_version)
+    engine_version_error = _unsupported_aurora_engine_version_error(engine, explicit_engine_version)
     if engine_version_error:
         return engine_version_error
     engine_version = explicit_engine_version or _default_engine_version(engine)
@@ -4938,11 +4953,7 @@ def _describe_engine_versions(p):
         "mariadb": [
             ("10.6.14", "10.6"), ("10.5.21", "10.5"),
         ],
-        "aurora-postgresql": [
-            ("18.3", "aurora-postgresql18"), ("17.5", "aurora-postgresql17"),
-            ("16.4", "aurora-postgresql16"),
-            ("15.3", "aurora-postgresql15"), ("14.8", "aurora-postgresql14"),
-        ],
+        "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSIONS,
         "aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
     }
     versions = versions_map.get(engine, [("15.3", "15")])
@@ -4976,7 +4987,7 @@ def _describe_orderable_options(p):
     engine = _p(p, "Engine") or "postgres"
     engine_version = _p(p, "EngineVersion")
     db_class = _p(p, "DBInstanceClass")
-    engine_version_error = _unsupported_aurora_mysql_engine_version_error(engine, engine_version)
+    engine_version_error = _unsupported_aurora_engine_version_error(engine, engine_version)
     if engine_version_error:
         return engine_version_error
 
@@ -5553,15 +5564,15 @@ def _default_engine_version(engine):
     return defaults.get(engine, "15.3")
 
 
-def _unsupported_aurora_mysql_engine_version_error(engine, engine_version):
-    if (
-        engine == "aurora-mysql"
-        and engine_version
-        and engine_version not in AURORA_MYSQL_ENGINE_VERSION_SET
-    ):
+def _unsupported_aurora_engine_version_error(engine, engine_version):
+    supported = {
+        "aurora-mysql": AURORA_MYSQL_ENGINE_VERSION_SET,
+        "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSION_SET,
+    }.get(engine)
+    if supported is not None and engine_version and engine_version not in supported:
         return _error(
             "InvalidParameterCombination",
-            f"Cannot find version {engine_version} for aurora-mysql",
+            f"Cannot find version {engine_version} for {engine}",
             400,
         )
     return None

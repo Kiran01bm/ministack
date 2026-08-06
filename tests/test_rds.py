@@ -19,6 +19,7 @@ from conftest import ENDPOINT
 
 DEFAULT_AURORA_MYSQL_ENGINE_VERSION = "8.0.mysql_aurora.3.10.3"
 UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION = "9.0.mysql_aurora.9.0.1"
+UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION = "16.99"
 EXPECTED_AURORA_MYSQL_ENGINE_VERSIONS = {
     "5.7.mysql_aurora.2.11.1": "aurora-mysql5.7",
     "5.7.mysql_aurora.2.11.2": "aurora-mysql5.7",
@@ -1080,6 +1081,58 @@ def test_rds_aurora_mysql_create_rejects_unsupported_explicit_engine_version(rds
         instance_exc.value.response["Error"]["Message"]
         == f"Cannot find version {UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION} for aurora-mysql"
     )
+
+
+def test_rds_aurora_postgresql_create_rejects_unsupported_explicit_engine_version(rds):
+    with pytest.raises(ClientError) as cluster_exc:
+        rds.create_db_cluster(
+            DBClusterIdentifier="unsupported-apg-version-cluster",
+            Engine="aurora-postgresql",
+            EngineVersion=UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION,
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )
+    assert cluster_exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    assert (
+        cluster_exc.value.response["Error"]["Message"]
+        == f"Cannot find version {UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION} for aurora-postgresql"
+    )
+
+    with pytest.raises(ClientError) as instance_exc:
+        rds.create_db_instance(
+            DBInstanceIdentifier="unsupported-apg-version-instance",
+            DBInstanceClass="db.t3.micro",
+            Engine="aurora-postgresql",
+            EngineVersion=UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION,
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+            AllocatedStorage=20,
+        )
+    assert instance_exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    assert (
+        instance_exc.value.response["Error"]["Message"]
+        == f"Cannot find version {UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION} for aurora-postgresql"
+    )
+
+
+def test_rds_aurora_postgresql_create_accepts_cataloged_engine_version(rds):
+    rds.create_db_cluster(
+        DBClusterIdentifier="supported-apg-164-cluster",
+        Engine="aurora-postgresql",
+        EngineVersion="16.4",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )
+    try:
+        cluster = rds.describe_db_clusters(
+            DBClusterIdentifier="supported-apg-164-cluster"
+        )["DBClusters"][0]
+        assert cluster["EngineVersion"] == "16.4"
+    finally:
+        rds.delete_db_cluster(
+            DBClusterIdentifier="supported-apg-164-cluster",
+            SkipFinalSnapshot=True,
+        )
 
 
 def test_rds_aurora_mysql_create_accepts_cataloged_84_engine_version(rds):
