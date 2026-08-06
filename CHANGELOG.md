@@ -8,7 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
-- **RDS — duplicate DB instance wire code matches AWS** — a duplicate `CreateDBInstance`, `CreateDBInstanceReadReplica`, or `RestoreDBInstanceFromDBSnapshot` target returned wire code `DBInstanceAlreadyExistsFault`, but real AWS omits the `Fault` suffix for instance-level error codes (cluster-level codes such as `DBClusterAlreadyExistsFault` keep it). SDKs match the exact string to produce their typed error — aws-sdk-go-v2, for example, deserialized the response as a generic API error instead of the typed `DBInstanceAlreadyExistsFault`. The wire code is now `DBInstanceAlreadyExists`. Contributed by @kiran01bm.
+- **RDS — duplicate DB instance wire code matches AWS** — a duplicate `CreateDBInstance`, `CreateDBInstanceReadReplica`, or `RestoreDBInstanceFromDBSnapshot` target returned wire code `DBInstanceAlreadyExistsFault`, but real AWS omits the `Fault` suffix for instance-level error codes (cluster-level codes such as `DBClusterAlreadyExistsFault` keep it). SDKs match the exact string to produce their typed error — aws-sdk-go-v2, for example, deserialized the response as a generic API error instead of the typed `DBInstanceAlreadyExistsFault`. The wire code is now `DBInstanceAlreadyExists`. This deliberately reverts the v1.1.18 change, which mistook the SDK exception *shape name* for the *wire code* — the model's `error.code` field (`DBInstanceAlreadyExists`) is what SDKs match, and exact-string tests now pin the correct direction. Contributed by @kiran01bm.
 
 ## [1.4.13] — 2026-08-06
 
