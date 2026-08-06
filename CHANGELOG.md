@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **RDS — `StopDBCluster` / `StartDBCluster` now stop and start Aurora compute** — both operations only flipped metadata: a "stopped" cluster's backing container kept running and accepting SQL connections, and its members never left `available`. `StopDBCluster` now stops the cluster's shared container — preserving the container, volume, and data, exactly like Aurora keeps the cluster volume — and marks the cluster and every member `stopped`. `StartDBCluster` restarts the preserved container (recreating compute from the persistent named volume when the container is gone or unrestartable) and, like `CreateDBInstance`, returns immediately with a transitional status while a readiness worker flips the cluster and members to `available` once the database accepts authenticated connections. Invalid transitions return the AWS-exact `InvalidDBClusterStateFault` messages, and a warm boot keeps an intentionally stopped cluster stopped instead of reviving its compute. Contributed by @kiran01bm.
+
 ## [1.4.13] — 2026-08-06
 
 ### Fixed
