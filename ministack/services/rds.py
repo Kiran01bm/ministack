@@ -353,8 +353,10 @@ def restore_state(data):
                     member["DBInstanceStatus"] = "failed"
                 return
             if cluster.get("Status") == "stopped":
-                # Real AWS keeps a stopped cluster stopped across host
-                # restarts; only StartDBCluster brings compute back.
+                # A stopped cluster stays stopped across host restarts;
+                # StartDBCluster brings compute back. (Real AWS also
+                # auto-starts a cluster stopped for seven days — out of
+                # scope for an emulator.)
                 cluster.pop("_shared_legacy_migration_in_progress", None)
                 cluster["_shared_container_ready"] = False
                 for member in members:
@@ -941,8 +943,12 @@ def _stop_cluster_shared_container(cluster_id, cluster):
     DB instance is deleted, and while the cluster is stopped via
     ``StopDBCluster`` — but no SQL endpoint is reachable until compute
     returns. A stopped Docker container models that split: the cluster still
-    owns the container and its data, while only DeleteDBCluster removes
-    either one.
+    owns its data, and the cluster-owned volume is only removed by
+    DeleteDBCluster (the container itself may be replaced if a later
+    StartDBCluster has to fall back to recreating compute).
+
+    Returns True when compute is stopped — including when there was nothing
+    to stop — and False when a running container could not be stopped.
     """
     with _shared_container_lock:
         # Invalidate every readiness worker before the potentially slow Docker
@@ -955,9 +961,14 @@ def _stop_cluster_shared_container(cluster_id, cluster):
         container_id = cluster.get("_shared_container_id")
         docker_client = _get_docker()
         if not docker_client or not container_id:
-            return
+            return True
         try:
             container = docker_client.containers.get(container_id)
+        except Exception:
+            # A container that no longer exists is not running compute; the
+            # goal state is already met.
+            return True
+        try:
             container.reload()
             if container.status not in ("created", "exited", "dead", "removing"):
                 container.stop(timeout=5)
@@ -968,6 +979,8 @@ def _stop_cluster_shared_container(cluster_id, cluster):
                 cluster_id,
                 e,
             )
+            return False
+        return True
 
 
 def _remove_cluster_shared_resources(
@@ -2418,6 +2431,17 @@ def _create_db_instance(p):
                 "migration is blocked.",
                 400,
             )
+        if parent.get("Status") == "stopped":
+            # Real AWS rejects instance additions to a stopped cluster; the
+            # cluster must be started first. Without this guard the new
+            # member would land as ``creating`` with no readiness worker to
+            # ever complete it.
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"DbCluster {parent['DBClusterIdentifier']} is in stopped "
+                "state but expected it to be one of available.",
+                400,
+            )
         cluster_id_param = parent["DBClusterIdentifier"]
         engine = parent.get("Engine", engine)
         engine_version = parent.get("EngineVersion", engine_version)
@@ -2925,6 +2949,25 @@ def _delete_db_instance(p):
     if instance.get("DeletionProtection"):
         return _error("InvalidParameterCombination",
             "Cannot delete a DB instance when DeletionProtection is enabled.", 400)
+
+    parent_cluster_id = (
+        instance.get("_shared_cluster_id")
+        or instance.get("DBClusterIdentifier")
+    )
+    if parent_cluster_id:
+        parent = _resolve_cluster_in_request_region(parent_cluster_id)
+        if parent and parent.get("Status") == "stopped":
+            # Real AWS rejects member deletion from a stopped cluster; the
+            # cluster must be started first. Without this guard, deleting
+            # the last member of a stopped cluster would let a later
+            # CreateDBInstance restart compute behind the ``stopped``
+            # status.
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"DbCluster {parent['DBClusterIdentifier']} is in stopped "
+                "state but expected it to be one of available.",
+                400,
+            )
 
     _unregister_instance_from_clusters(instance_id)
 
@@ -4362,6 +4405,10 @@ def _start_db_cluster(p):
         if wrong_region:
             return wrong_region
         return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+    # The request may identify the cluster by ARN; every downstream consumer
+    # (the readiness worker's re-lookup, Docker container naming) needs the
+    # canonical identifier.
+    cluster_id = cluster["DBClusterIdentifier"]
     status = cluster.get("Status")
     if status != "stopped":
         # Real AWS message shape, verified against live transcripts:
@@ -4369,7 +4416,7 @@ def _start_db_cluster(p):
         # stopped,inaccessible-encryption-credentials-recoverable."
         return _error(
             "InvalidDBClusterStateFault",
-            f"DbCluster {cluster.get('DBClusterIdentifier', cluster_id)} is "
+            f"DbCluster {cluster_id} is "
             f"in {status} state but expected it to be one of "
             "stopped,inaccessible-encryption-credentials-recoverable.",
             400,
@@ -4408,6 +4455,22 @@ def _start_db_cluster(p):
         )
 
     if not start_result.get("started"):
+        if start_result.get("failed"):
+            # Both the restart and the recreate fallback genuinely failed
+            # (Docker error, missing image, port exhaustion). Compute did
+            # not come back: keep the cluster stopped so StartDBCluster can
+            # be retried, and surface the failure instead of reporting a
+            # dead endpoint as available. The cluster-owned volume is
+            # untouched, so data survives for the retry.
+            cluster["Status"] = "stopped"
+            for inst in member_instances:
+                inst["DBInstanceStatus"] = "stopped"
+            return _error(
+                "InternalFailure",
+                f"Failed to start compute for DB cluster {cluster_id}.",
+                500,
+            )
+        # Benign control-plane-only outcome: no Docker in this environment.
         cluster["_shared_container_ready"] = True
         cluster["Status"] = "available"
         for inst in member_instances:
@@ -4480,44 +4543,73 @@ def _start_db_cluster(p):
                 )
                 return
 
-            def _fail_members():
+            # Real AWS lands a failed start back on ``stopped`` — never on a
+            # transitional status — so StartDBCluster can simply be retried.
+            def _fail_start():
+                # Stop the failed container first (a failed password rotation
+                # leaves it running and reachable; for an already-exited
+                # container this is a no-op) so the ``stopped`` status is
+                # honest the moment it becomes visible and a retried
+                # StartDBCluster begins from cleanly stopped compute. Holding
+                # _shared_container_lock across the Docker stop matches
+                # _stop_cluster_shared_container and keeps a concurrent retry
+                # from racing the stop.
+                client = _get_docker()
+                if client and container_id:
+                    try:
+                        failed = client.containers.get(container_id)
+                        failed.reload()
+                        if failed.status not in (
+                            "created", "exited", "dead", "removing",
+                        ):
+                            failed.stop(timeout=5)
+                    except Exception:
+                        pass
                 cluster["_shared_container_ready"] = False
+                cluster["Status"] = "stopped"
                 for inst in _cluster_member_instances(cluster):
-                    inst["DBInstanceStatus"] = "failed"
-                _refresh_cluster_status(cluster_id)
+                    inst["DBInstanceStatus"] = "stopped"
 
+            start_failed = False
+            pending_rotation = cluster.get("_pending_master_password_rotation")
             if not database_ready:
                 logger.warning(
                     "RDS: cluster %s container exited before becoming "
                     "reachable after StartDBCluster", cluster_id,
                 )
-                _fail_members()
-                return
-            pending_rotation = cluster.get("_pending_master_password_rotation")
-            if pending_rotation and not _rotate_real_password(
+                _fail_start()
+                start_failed = True
+            elif pending_rotation and not _rotate_real_password(
                 cluster,
                 pending_rotation["old_password"],
                 pending_rotation["new_password"],
             ):
-                _fail_members()
-                return
-            if pending_rotation:
-                cluster.pop("_pending_master_password_rotation", None)
-                _sync_global_mysql_credentials(cluster)
-            if _is_mysql_engine(engine) and not _mysql_replication_secondary(
-                cluster,
-            ):
-                _grant_mysql_master_user_privileges(
-                    ready_host, ready_port, master_user,
-                    cluster.get("_MasterUserPassword", master_pass),
-                    cluster_id,
-                )
-            cluster["_shared_container_ready"] = True
-            for inst in _cluster_member_instances(cluster):
-                _attach_instance_to_shared_cluster(inst, cluster)
-                inst["DBInstanceStatus"] = "available"
-            _sync_cluster_endpoints(cluster)
-            _refresh_cluster_status(cluster_id)
+                _fail_start()
+                start_failed = True
+            if not start_failed:
+                if pending_rotation:
+                    cluster.pop("_pending_master_password_rotation", None)
+                    _sync_global_mysql_credentials(cluster)
+                if _is_mysql_engine(engine) and not _mysql_replication_secondary(
+                    cluster,
+                ):
+                    _grant_mysql_master_user_privileges(
+                        ready_host, ready_port, master_user,
+                        cluster.get("_MasterUserPassword", master_pass),
+                        cluster_id,
+                    )
+                cluster["_shared_container_ready"] = True
+                for inst in _cluster_member_instances(cluster):
+                    _attach_instance_to_shared_cluster(inst, cluster)
+                    inst["DBInstanceStatus"] = "available"
+                _sync_cluster_endpoints(cluster)
+                _refresh_cluster_status(cluster_id)
+        if start_failed:
+            logger.warning(
+                "RDS: cluster %s failed to start; returned to stopped",
+                cluster_id,
+            )
+            return
         logger.info("RDS: cluster %s started and ready", cluster_id)
 
     threading.Thread(target=ctx.run, args=(_bg_start_ready,), daemon=True).start()
@@ -4545,9 +4637,20 @@ def _stop_db_cluster(p):
             f"in {status} state but expected it to be one of available.",
             400,
         )
-    _stop_cluster_shared_container(
+    if not _stop_cluster_shared_container(
         cluster.get("DBClusterIdentifier", cluster_id), cluster,
-    )
+    ):
+        # Compute is still running; publishing ``stopped`` here would be the
+        # reachable-endpoint lie this state machine exists to prevent.
+        # Restore readiness (the container is still serving) and surface the
+        # failure so StopDBCluster can be retried.
+        cluster["_shared_container_ready"] = True
+        return _error(
+            "InternalFailure",
+            "Failed to stop compute for DB cluster "
+            f"{cluster.get('DBClusterIdentifier', cluster_id)}.",
+            500,
+        )
     cluster["Status"] = "stopped"
     for inst in _cluster_member_instances(cluster):
         inst["DBInstanceStatus"] = "stopped"
