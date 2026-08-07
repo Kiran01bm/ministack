@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **CodeBuild - builds can really run (`MINISTACK_CODEBUILD_EXECUTE=1`)** - `StartBuild` returned a build that was already `SUCCEEDED`, so a pipeline rehearsed against MiniStack reported a pass without a single phase having run, and a buildspec that fails on AWS still looked green locally. With the flag set, `StartBuild` returns `IN_PROGRESS` and the project's inline buildspec is handed to the official AWS CodeBuild local agent (`public.ecr.aws/codebuild/local-builds`), which runs the phases in the project's `environment.image` the way CodeBuild does - the phase semantics come from AWS's own agent instead of a reimplemented executor. `BatchGetBuilds` reflects progress while the build runs: the agent's `Phase complete: <PHASE> State: <STATUS>` lines become `phases` entries, and the container's exit status maps to `SUCCEEDED` / `FAILED`, with `FAULT` when Docker is unreachable. `environment.environmentVariables`, `privilegedMode`, and the `CODEBUILD_BUILD_ID` / `_ARN` / `_NUMBER` / `_INITIATOR` variables reach the build. The build reaches back into MiniStack: `AWS_ENDPOINT_URL` (plus placeholder credentials) is injected unless the project declares its own, so `aws s3 cp` inside a build hits this emulator rather than real AWS. `timeoutInMinutes` is enforced (the build is stopped and its phase reported `TIMED_OUT`), and a restored build that was in flight when MiniStack stopped is reported `FAULT` rather than polling as running forever. `StopBuild` is honoured deterministically: it records the intent before removing the container, so the worker reports the requested `STOPPED` instead of racing it to `FAULT`. Build output also reaches CloudWatch Logs: the record already advertised `logs.groupName` / `logs.streamName`, and an executed build now writes the agent output there, so `aws logs get-log-events` and `aws logs tail` read back a real build log instead of an empty stream. Default behaviour is unchanged - without the flag builds stay metadata-only. Requires the Docker socket; the agent image and workspace path are fixed internals, not configurable.
+
 ## [1.4.13] — 2026-08-06
 
 ### Fixed
