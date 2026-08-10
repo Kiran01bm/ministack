@@ -1384,9 +1384,6 @@ def _get_key_rotation_status(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
         return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
-    err = _reject_rotation_for_hmac(rec, "GetKeyRotationStatus")
-    if err:
-        return err
     return json_response({
         "KeyRotationEnabled": rec.get("KeyRotationEnabled", False),
         "RotationPeriodInDays": rec.get("RotationPeriodInDays", 365),
