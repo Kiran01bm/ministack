@@ -5,6 +5,11 @@ All notable changes to MiniStack will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **RDS — internal: Aurora cluster compute lifecycle reshaped for per-instance containers** — no behavior change. Container-ownership decisions (instance delete, reset) now go through a single `_instance_owns_container` predicate, cluster-wide stop enumerates all cluster-owned containers (deduplicated, and logged per container), and `ReaderEndpoint` resolution goes through a dedicated seam. Groundwork for per-instance reader containers with streaming replication (#1325, slice 1). Contributed by @kiran01bm.
+
 ## [1.4.15] — 2026-08-10
 
 ### Added
