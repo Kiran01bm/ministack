@@ -470,6 +470,167 @@ def test_cfn_stack_with_parameters(cfn, sqs):
     urls = sqs.list_queues(QueueNamePrefix="cfn-t02-custom").get("QueueUrls", [])
     assert any("cfn-t02-custom" in u for u in urls)
 
+
+def test_cfn_unnamed_dynamodb_table_survives_unrelated_update(cfn, ddb, ssm):
+    """A stack update must not touch an auto-named resource whose own
+    properties didn't change — DynamoDB::Table has no update handler, so it
+    falls back to calling create again on every update. That create wasn't
+    idempotent: with no explicit TableName, it derived a fresh name every
+    call, so any update of a stack containing an unnamed table silently
+    created a second, empty table under a new name — and an unrelated
+    resource referencing the table via Ref (real CloudFormation propagates
+    that Ref's resolved value on every update) picked up that new, wrong
+    identity the moment it was reprocessed."""
+    def template(param_value_source):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Table": {
+                    "Type": "AWS::DynamoDB::Table",
+                    "Properties": {
+                        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                        "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                        "BillingMode": "PAY_PER_REQUEST",
+                    },
+                },
+                "Param": {
+                    "Type": "AWS::SSM::Parameter",
+                    "Properties": {
+                        "Name": "/cfn-t02f/table-name",
+                        "Type": "String",
+                        "Value": param_value_source,
+                        "Description": "unrelated change forces this resource to be reprocessed",
+                    },
+                },
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-t02f", TemplateBody=template({"Ref": "Table"}))
+    _wait_stack(cfn, "cfn-t02f")
+    tables_before = set(ddb.list_tables()["TableNames"])
+    table_name_before = ssm.get_parameter(Name="/cfn-t02f/table-name")["Parameter"]["Value"]
+    assert table_name_before in tables_before
+
+    # Table itself is untouched; only Param's Description changes (forcing
+    # Param, not Table, to actually be reprocessed this update).
+    cfn.update_stack(StackName="cfn-t02f", TemplateBody=template({"Ref": "Table"}))
+    stack = _wait_stack(cfn, "cfn-t02f")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    tables_after = set(ddb.list_tables()["TableNames"])
+    table_name_after = ssm.get_parameter(Name="/cfn-t02f/table-name")["Parameter"]["Value"]
+    assert tables_after == tables_before
+    assert table_name_after == table_name_before
+    
+def test_cfn_ssm_parameter_value_type_resolves_stored_value(cfn, ssm, sqs):
+    """A `AWS::SSM::Parameter::Value<String>` template parameter's Default/
+    provided value is an SSM parameter *name*, not the value itself — real
+    CloudFormation resolves it against SSM Parameter Store before `Ref` ever
+    sees it (the mechanism behind CDK's `StringParameter.valueForStringParameter`).
+    Ref must yield the stored value, not the parameter name."""
+    ssm.put_parameter(Name="/cfn-t02c/queue-name", Value="cfn-t02c-resolved", Type="String")
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {
+            "QueueName": {
+                "Type": "AWS::SSM::Parameter::Value<String>",
+                "Default": "/cfn-t02c/queue-name",
+            }
+        },
+        "Resources": {
+            "Queue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": {"Ref": "QueueName"}},
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-t02c", TemplateBody=json.dumps(template))
+    _wait_stack(cfn, "cfn-t02c")
+
+    urls = sqs.list_queues(QueueNamePrefix="cfn-t02c-resolved").get("QueueUrls", [])
+    assert any("cfn-t02c-resolved" in u for u in urls)
+    # Never the literal parameter name — that would mean resolution silently
+    # fell back to treating the SSM path as the value itself.
+    urls_by_name = sqs.list_queues(QueueNamePrefix="cfn-t02c/queue-name").get("QueueUrls", [])
+    assert urls_by_name == []
+
+
+def test_cfn_ssm_parameter_value_type_use_previous_value_on_update(cfn, ssm, sqs):
+    """A change set that re-sends an AWS::SSM::Parameter::Value<String>
+    parameter as UsePreviousValue (the `aws cloudformation deploy`
+    no-`--parameter-overrides` path, and what CDK sends for parameters it
+    isn't touching, e.g. its own BootstrapVersion) must reuse the
+    already-resolved value from the prior deployment as-is — not feed that
+    resolved value back into another SSM lookup, where it would almost
+    never itself be a valid parameter name and the update would fail."""
+    ssm.put_parameter(Name="/cfn-t02e/queue-name", Value="cfn-t02e-resolved", Type="String")
+
+    def template(bucket_tag):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Parameters": {
+                "QueueName": {
+                    "Type": "AWS::SSM::Parameter::Value<String>",
+                    "Default": "/cfn-t02e/queue-name",
+                },
+                "Tag": {"Type": "String", "Default": bucket_tag},
+            },
+            "Resources": {
+                "Queue": {
+                    "Type": "AWS::SQS::Queue",
+                    "Properties": {
+                        "QueueName": {"Ref": "QueueName"},
+                        "Tags": [{"Key": "build", "Value": {"Ref": "Tag"}}],
+                    },
+                }
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-t02e", TemplateBody=template("v1"))
+    _wait_stack(cfn, "cfn-t02e")
+
+    # Second deploy changes an unrelated parameter (Tag) and re-sends
+    # QueueName as UsePreviousValue, exactly as CDK does for parameters it
+    # isn't updating this deploy.
+    cfn.create_change_set(
+        StackName="cfn-t02e", ChangeSetName="cs2", TemplateBody=template("v2"),
+        Parameters=[{"ParameterKey": "QueueName", "UsePreviousValue": True}],
+    )
+    cfn.execute_change_set(StackName="cfn-t02e", ChangeSetName="cs2")
+    stack = _wait_stack(cfn, "cfn-t02e")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    urls = sqs.list_queues(QueueNamePrefix="cfn-t02e-resolved").get("QueueUrls", [])
+    assert any("cfn-t02e-resolved" in u for u in urls)
+
+
+def test_cfn_ssm_parameter_value_type_missing_parameter_fails_stack(cfn):
+    """An `AWS::SSM::Parameter::Value<String>` naming a parameter that was
+    never put must fail the same way real CloudFormation does — a
+    synchronous ValidationError at CreateStack time (parameter resolution
+    happens before the stack is created), not a silent resolve to the
+    parameter's own name string."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {
+            "QueueName": {
+                "Type": "AWS::SSM::Parameter::Value<String>",
+                "Default": "/cfn-t02d/does-not-exist",
+            }
+        },
+        "Resources": {
+            "Queue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": {"Ref": "QueueName"}},
+            }
+        },
+    }
+    with pytest.raises(ClientError) as exc_info:
+        cfn.create_stack(StackName="cfn-t02d", TemplateBody=json.dumps(template))
+    assert exc_info.value.response["Error"]["Code"] == "ValidationError"
+
+
 def test_cfn_change_set_use_previous_value_updates_resource(cfn, ssm):
     """A change set created with UsePreviousValue (the `aws cloudformation deploy`
     no-`--parameter-overrides` path) must resolve the parameter to its stored
@@ -3779,6 +3940,50 @@ def test_cfn_eventbus_getatt_arn(cfn, eb):
 
     cfn.delete_stack(StackName="cfn-eb-t03")
     _wait_stack(cfn, "cfn-eb-t03")
+
+
+def test_cfn_eventbus_survives_unrelated_update(cfn, eb, sqs):
+    """A stack update must not fail an unchanged AWS::Events::EventBus.
+
+    EventBus has no update handler, so an update falls back to calling
+    create again — a name that already exists (its own, from the previous
+    deploy — e.g. a name computed client-side and baked into the template,
+    like CDK's EventBus construct default-names its bus) previously made
+    every update of a stack containing one fail with "already exists", even
+    when nothing about the bus itself changed. Fixed generically (see
+    _update_resource's no-op short-circuit), not with EventBus-specific
+    logic — this exercises that general fix against a real resource type
+    known to hit it."""
+    def template(queue_name):
+        return json.dumps({
+            "AWSTemplateFormatVersion": "2010-09-09",
+            "Resources": {
+                "Bus": {
+                    "Type": "AWS::Events::EventBus",
+                    "Properties": {"Name": "cfn-eb-t10"},
+                },
+                "Queue": {
+                    "Type": "AWS::SQS::Queue",
+                    "Properties": {"QueueName": queue_name},
+                },
+            },
+        })
+
+    cfn.create_stack(StackName="cfn-eb-t10", TemplateBody=template("cfn-eb-t10-q1"))
+    stack = _wait_stack(cfn, "cfn-eb-t10")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    bus_before = eb.describe_event_bus(Name="cfn-eb-t10")
+
+    # Only the queue changes — the bus is untouched, exactly like a real
+    # redeploy that doesn't touch AuditTrail at all.
+    cfn.update_stack(StackName="cfn-eb-t10", TemplateBody=template("cfn-eb-t10-q2"))
+    stack = _wait_stack(cfn, "cfn-eb-t10")
+    assert stack["StackStatus"] == "UPDATE_COMPLETE"
+
+    bus_after = eb.describe_event_bus(Name="cfn-eb-t10")
+    assert bus_after["Arn"] == bus_before["Arn"]
+    urls = sqs.list_queues(QueueNamePrefix="cfn-eb-t10-q2").get("QueueUrls", [])
+    assert any("cfn-eb-t10-q2" in u for u in urls)
 
 
 def test_cfn_eventbus_tags(cfn, eb):
