@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **IoT — `CreateThingType` is idempotent for identical re-creates** — re-creating an existing thing type always returned `ResourceAlreadyExistsException`, so a retried request or a re-run provisioning script failed where AWS succeeds. The same `thingTypeProperties` now return the existing ids — absent, `null` and empty compare equal, `searchableAttributes` is unordered — and only a real mismatch keeps the `409`, as `CreateThing` already did. Contributed by @iot-rocket.
 - **EC2 — `RevokeSecurityGroupIngress` / `RevokeSecurityGroupEgress` honour `SecurityGroupRuleIds`** — both read only `IpPermissions`, so a revoke by rule id (as Terraform does) returned `Return=true` while removing nothing, leaving the rule in place forever. Ids now resolve against the group's `sgr-*` rules, which are removed with their tags and echoed in `revokedSecurityGroupRuleSet`; one unknown id rejects the whole call with `InvalidSecurityGroupRuleId.NotFound`. Contributed by @iot-rocket.
 
 ## [1.4.16] — 2026-08-12
