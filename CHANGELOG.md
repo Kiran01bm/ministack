@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — Aurora engine versions are validated on non-create writes and global inheritance** — `ModifyDBCluster`, `CreateGlobalCluster`, and `ModifyGlobalCluster` stored arbitrary Aurora engine versions that the shared engine catalog did not advertise, and `CreateDBCluster` could inherit such a version from legacy global-cluster state even though supplying it explicitly was rejected. All four paths now use the create-time shared catalog validator and reject unknown versions with `InvalidParameterCombination` / `Cannot find version {version} for {engine}` before mutating state. Contributed by @kiran01bm.
+
 ## [1.4.20] — 2026-08-19
 
 ### Added

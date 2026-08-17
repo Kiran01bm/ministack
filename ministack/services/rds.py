@@ -4079,6 +4079,11 @@ def _create_db_cluster(p):
     engine_version = explicit_engine_version or _default_engine_version(engine)
     if global_cluster:
         expected_engine_version = global_cluster.get("EngineVersion")
+        inherited_version_error = _unsupported_aurora_engine_version_error(
+            engine, expected_engine_version
+        )
+        if inherited_version_error:
+            return inherited_version_error
         if (
             explicit_engine_version
             and expected_engine_version
@@ -4516,8 +4521,14 @@ def _modify_db_cluster(p):
             "in the same request.",
             400,
         )
-    if _p(p, "EngineVersion"):
-        cluster["EngineVersion"] = _p(p, "EngineVersion")
+    engine_version = _p(p, "EngineVersion")
+    engine_version_error = _unsupported_aurora_engine_version_error(
+        cluster.get("Engine"), engine_version
+    )
+    if engine_version_error:
+        return engine_version_error
+    if engine_version:
+        cluster["EngineVersion"] = engine_version
     if _p(p, "MasterUserPassword"):
         if cluster.get("MasterUserSecret"):
             return _error(
@@ -5866,6 +5877,10 @@ def _create_global_cluster(p):
         engine = source_cluster["Engine"]
         engine_version = source_cluster["EngineVersion"]
 
+    engine_version_error = _unsupported_aurora_engine_version_error(engine, engine_version)
+    if engine_version_error:
+        return engine_version_error
+
     gc = {
         "GlobalClusterIdentifier": gc_id,
         "GlobalClusterArn": arn,
@@ -6001,6 +6016,13 @@ def _modify_global_cluster(p):
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {gc_id} not found.", 404)
 
+    engine_version = _p(p, "EngineVersion")
+    engine_version_error = _unsupported_aurora_engine_version_error(
+        gc.get("Engine"), engine_version
+    )
+    if engine_version_error:
+        return engine_version_error
+
     new_id = _p(p, "NewGlobalClusterIdentifier")
     if new_id and new_id != gc_id:
         invalid_new_id = _invalid_global_cluster_identifier_error(new_id)
@@ -6021,8 +6043,8 @@ def _modify_global_cluster(p):
 
     if _p(p, "DeletionProtection"):
         gc["DeletionProtection"] = _p(p, "DeletionProtection") == "true"
-    if _p(p, "EngineVersion"):
-        gc["EngineVersion"] = _p(p, "EngineVersion")
+    if engine_version:
+        gc["EngineVersion"] = engine_version
 
     return _xml(200, "ModifyGlobalClusterResponse",
         f"<ModifyGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></ModifyGlobalClusterResult>")

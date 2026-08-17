@@ -786,7 +786,7 @@ def test_rds_global_cluster_lifecycle(rds):
     rds.create_global_cluster(
         GlobalClusterIdentifier="test-global-1",
         Engine="aurora-postgresql",
-        EngineVersion="15.3",
+        EngineVersion="15.13",
     )
     try:
         resp = rds.describe_global_clusters(GlobalClusterIdentifier="test-global-1")
@@ -1292,6 +1292,100 @@ def test_rds_aurora_postgresql_create_accepts_bare_major_engine_version(rds):
             DBClusterIdentifier="supported-apg-major-cluster",
             SkipFinalSnapshot=True,
         )
+
+
+def test_rds_aurora_postgresql_modify_cluster_validates_engine_version(rds):
+    cluster_id = "modify-apg-engine-version"
+    rds.create_db_cluster(
+        DBClusterIdentifier=cluster_id,
+        Engine="aurora-postgresql",
+        EngineVersion="16.8",
+        MasterUsername="admin",
+        MasterUserPassword="password123",
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.modify_db_cluster(
+                DBClusterIdentifier=cluster_id,
+                EngineVersion=UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        assert (
+            exc.value.response["Error"]["Message"]
+            == f"Cannot find version {UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION} for aurora-postgresql"
+        )
+
+        modified = rds.modify_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            EngineVersion="16.9",
+        )["DBCluster"]
+        assert modified["EngineVersion"] == "16.9"
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+def test_rds_aurora_postgresql_create_global_cluster_rejects_engine_version(rds):
+    with pytest.raises(ClientError) as exc:
+        rds.create_global_cluster(
+            GlobalClusterIdentifier="unsupported-apg-create-global-version",
+            Engine="aurora-postgresql",
+            EngineVersion=UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION,
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+    assert (
+        exc.value.response["Error"]["Message"]
+        == f"Cannot find version {UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION} for aurora-postgresql"
+    )
+
+
+def test_rds_aurora_postgresql_modify_global_cluster_rejects_engine_version(rds):
+    global_id = "unsupported-apg-modify-global-version"
+    rds.create_global_cluster(
+        GlobalClusterIdentifier=global_id,
+        Engine="aurora-postgresql",
+        EngineVersion="16.8",
+    )
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.modify_global_cluster(
+                GlobalClusterIdentifier=global_id,
+                EngineVersion=UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION,
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        assert (
+            exc.value.response["Error"]["Message"]
+            == f"Cannot find version {UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION} for aurora-postgresql"
+        )
+    finally:
+        rds.delete_global_cluster(GlobalClusterIdentifier=global_id)
+
+
+def test_rds_aurora_postgresql_global_inherit_rejects_legacy_engine_version():
+    from ministack.services import rds as rds_service
+
+    global_id = "legacy-unsupported-apg-global-version"
+    rds_service._global_clusters[global_id] = {
+        "GlobalClusterIdentifier": global_id,
+        "Engine": "aurora-postgresql",
+        "EngineVersion": UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION,
+        "GlobalClusterMembers": [],
+    }
+    try:
+        status, _, body = rds_service._create_db_cluster({
+            "DBClusterIdentifier": "legacy-unsupported-apg-global-member",
+            "Engine": "aurora-postgresql",
+            "GlobalClusterIdentifier": global_id,
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        assert status == 400
+        assert b"InvalidParameterCombination" in body
+        assert (
+            f"Cannot find version {UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION} "
+            "for aurora-postgresql"
+        ).encode() in body
+    finally:
+        del rds_service._global_clusters[global_id]
 
 
 def test_rds_aurora_mysql_parameter_defaults_are_family_aware(rds):
@@ -6207,7 +6301,7 @@ def test_create_db_cluster_validates_global_cluster_identifier_and_engine():
         global_cluster = east.create_global_cluster(
             GlobalClusterIdentifier=global_id,
             Engine="aurora-postgresql",
-            EngineVersion="15.3",
+            EngineVersion="15.13",
         )["GlobalCluster"]
 
         with pytest.raises(ClientError) as exc:
