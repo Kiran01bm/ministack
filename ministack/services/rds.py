@@ -5416,6 +5416,8 @@ def _start_db_cluster(p):
                         cluster_id,
                     )
                 cluster["_shared_container_ready"] = True
+                if _aurora_mysql_8_replication_enabled(cluster):
+                    _configure_or_defer_mysql_replication(cluster_id, cluster)
                 for inst in _cluster_member_instances(cluster):
                     _attach_instance_to_shared_cluster(inst, cluster)
                     inst["DBInstanceStatus"] = "available"
@@ -5468,6 +5470,18 @@ def _stop_db_cluster(p):
             "reader instances yet; delete the reader instances first "
             "(MINISTACK_RDS_PG_CLUSTER_REPLICATION, "
             "https://github.com/ministackorg/ministack/issues/1325).",
+            400,
+        )
+    global_cluster, member = _global_cluster_member_for_cluster(cluster)
+    if (
+        global_cluster
+        and member
+        and len(global_cluster.get("GlobalClusterMembers", [])) > 1
+    ):
+        return _error(
+            "InvalidDBClusterStateFault",
+            "You can only stop and start a cluster that's part of an Aurora "
+            "global database if it's the only cluster in the global database.",
             400,
         )
     if not _stop_cluster_shared_container(

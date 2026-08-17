@@ -2368,6 +2368,136 @@ def _poll_until(predicate, timeout=5):
     return predicate()
 
 
+def test_rds_stop_db_cluster_refuses_nonsole_global_member(monkeypatch):
+    """A member cannot stop while another cluster remains in its global."""
+    from ministack.services import rds as m
+
+    stopped = []
+    monkeypatch.setattr(
+        m,
+        "_stop_cluster_shared_container",
+        lambda *args: stopped.append(args) or True,
+    )
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "global-stop-primary",
+            "Engine": "aurora-mysql",
+        })
+        cluster = m._clusters.get("global-stop-primary")
+        cluster["Status"] = "available"
+        global_cluster = {
+            "GlobalClusterIdentifier": "global-stop",
+            "GlobalClusterMembers": [
+                m._global_cluster_member(cluster, True),
+                {"DBClusterArn": "arn:aws:rds:us-west-2:000000000000:cluster:secondary"},
+            ],
+        }
+        m._global_clusters["global-stop"] = global_cluster
+        cluster["GlobalClusterIdentifier"] = "global-stop"
+
+        status, _, body = m._stop_db_cluster({
+            "DBClusterIdentifier": "global-stop-primary",
+        })
+
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert (
+            b"You can only stop and start a cluster that's part of an Aurora "
+            b"global database if it's the only cluster in the global database."
+            in body
+        )
+        assert stopped == []
+        assert cluster["Status"] == "available"
+    finally:
+        m._global_clusters.clear()
+        m._clusters.clear()
+
+
+def test_rds_stop_db_cluster_allows_sole_global_member(monkeypatch):
+    """The sole cluster in a global database remains stoppable."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_stop_cluster_shared_container", lambda *_args: True)
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "sole-global-member",
+            "Engine": "aurora-mysql",
+        })
+        cluster = m._clusters.get("sole-global-member")
+        cluster["Status"] = "available"
+        global_cluster = {
+            "GlobalClusterIdentifier": "sole-global",
+            "GlobalClusterMembers": [m._global_cluster_member(cluster, True)],
+        }
+        m._global_clusters["sole-global"] = global_cluster
+        cluster["GlobalClusterIdentifier"] = "sole-global"
+
+        status, _, _body = m._stop_db_cluster({
+            "DBClusterIdentifier": "sole-global-member",
+        })
+
+        assert status == 200
+        assert cluster["Status"] == "stopped"
+    finally:
+        m._global_clusters.clear()
+        m._clusters.clear()
+
+
+def test_rds_start_recreate_reconfigures_mysql_replication(monkeypatch):
+    """Recreated compute re-establishes its global MySQL replication role."""
+    from ministack.services import rds as m
+
+    docker, _container, state = _stop_start_fake_docker(
+        m._rds_cluster_docker_name("recreated-global-cluster"),
+    )
+    replication_calls = []
+    monkeypatch.setattr(m, "_get_docker", lambda: docker)
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
+    monkeypatch.setattr(m, "_next_port", lambda: 16076)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
+    monkeypatch.setattr(m, "_ensure_mysql_compatibility", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", lambda *_args: None)
+    monkeypatch.setattr(m, "_aurora_mysql_8_replication_enabled", lambda _cluster: True)
+    monkeypatch.setattr(
+        m,
+        "_configure_or_defer_mysql_replication",
+        lambda cluster_id, cluster: replication_calls.append((cluster_id, cluster)),
+    )
+
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "recreated-global-cluster",
+            "Engine": "aurora-mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        cluster = m._clusters.get("recreated-global-cluster")
+        cluster["Status"] = "stopped"
+        cluster["_shared_container_ready"] = False
+        cluster["_shared_storage_initialized"] = True
+        cluster["_shared_container_id"] = docker.containers.get(
+            m._rds_cluster_docker_name("recreated-global-cluster"),
+        ).id
+        replication_calls.clear()
+        state["fail_start"] = True
+
+        status, _, _body = m._start_db_cluster({
+            "DBClusterIdentifier": "recreated-global-cluster",
+        })
+
+        assert status == 200
+        assert _poll_until(lambda: cluster["Status"] == "available")
+        assert replication_calls == [("recreated-global-cluster", cluster)]
+    finally:
+        m._clusters.clear()
+
+
 def test_rds_start_db_cluster_accepts_cluster_arn(monkeypatch):
     """StartDBCluster by ARN must reach available, not wedge in starting."""
     from ministack.services import rds as m

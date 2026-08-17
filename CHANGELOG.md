@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — global Aurora stop/start preserves topology and MySQL replication** — `StopDBCluster` allowed an individual member of a multi-cluster Aurora global database to stop, leaving its emulated cross-Region replication broken, and a later `StartDBCluster` recreate fallback could publish `available` without re-linking the recreated MySQL container. Stops are now limited to sole-member global databases (`InvalidDBClusterStateFault`, 400), matching AWS, and successful starts reconfigure or defer the member's MySQL replication role after readiness. Contributed by @kiran01bm.
+
 ## [1.4.20] — 2026-08-19
 
 ### Added
