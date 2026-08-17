@@ -5062,6 +5062,20 @@ def _failover_db_cluster(p):
             "be one of available.",
             400,
         )
+    if cluster.get("_shared_legacy_migration_in_progress") or cluster.get(
+        "_shared_legacy_migration_blocked",
+    ):
+        # restore_state's one-time legacy-storage migration reads
+        # IsClusterWriter to pick which member's volume becomes the
+        # cluster's adopted shared state; flipping the flag mid-migration
+        # could make it adopt a reader's volume. Same gate as
+        # CreateDBInstance's cluster-member path.
+        return _error(
+            "InvalidDBClusterStateFault",
+            f"Cannot failover DB cluster {cluster_id} while legacy shared-"
+            "storage migration is in progress.",
+            400,
+        )
 
     members = cluster.get("DBClusterMembers", [])
     readers = [m for m in members if not m.get("IsClusterWriter")]
@@ -5090,7 +5104,13 @@ def _failover_db_cluster(p):
                 400,
             )
         target_instance = _resolve_instance(target_id)
-        if target_instance and target_instance.get("DBInstanceStatus") != "available":
+        if target_instance is None:
+            # A member with no backing instance record cannot happen today
+            # (deletion unregisters the member synchronously), but promoting
+            # a phantom would strand the cluster; refuse defensively.
+            return _error(
+                "DBInstanceNotFound", f"DBInstance {target_id} not found.", 404)
+        if target_instance.get("DBInstanceStatus") != "available":
             return _error(
                 "InvalidDBInstanceState",
                 f"DBInstance {target_id} is in "

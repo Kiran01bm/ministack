@@ -2676,6 +2676,42 @@ def test_rds_failover_db_cluster_promotes_lowest_tier_reader(monkeypatch):
         m._clusters.clear()
 
 
+def test_rds_failover_db_cluster_tier_tie_keeps_member_order(monkeypatch):
+    """A same-tier tie promotes the earlier member, as documented.
+
+    The automatic path relies on ``sorted()`` stability for the "within a
+    tier Ministack keeps member order" contract; this pins it so a refactor
+    to an unstable ordering (or a reordered candidates build) is caught.
+    """
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        _build_failover_cluster(m, "failover-tie-cluster", [
+            ("failover-tie-writer", 0),
+            ("failover-tie-reader-a", 1),
+            ("failover-tie-reader-b", 1),
+        ])
+        cluster = m._clusters.get("failover-tie-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+
+        status, _, _body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-tie-cluster",
+        })
+        assert status == 200
+        flags = _cluster_writer_flags(cluster)
+        assert flags == {
+            "failover-tie-writer": False,
+            "failover-tie-reader-a": True,
+            "failover-tie-reader-b": False,
+        }
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
 def test_rds_failover_db_cluster_explicit_target_validation(monkeypatch):
     """Explicit targets are validated: member, non-writer, and available."""
     from ministack.services import rds as m
@@ -2789,6 +2825,21 @@ def test_rds_failover_db_cluster_cluster_state_errors(monkeypatch):
         })
         assert status == 400
         assert b"InvalidDBClusterStateFault" in body
+
+        # An in-flight legacy-storage migration is rejected: restore_state
+        # reads IsClusterWriter to pick the adopted volume, so the flag must
+        # not flip mid-migration.
+        downed["_shared_legacy_migration_in_progress"] = True
+        m._instances.get("failover-downed-reader")["DBInstanceStatus"] = (
+            "available"
+        )
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-downed-cluster",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert b"legacy shared-storage migration" in body
+        downed.pop("_shared_legacy_migration_in_progress", None)
 
         # A stopped cluster is rejected before member checks.
         m._stop_db_cluster({"DBClusterIdentifier": "failover-solo-cluster"})
