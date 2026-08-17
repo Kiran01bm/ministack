@@ -121,7 +121,7 @@ _MYSQL_BINLOG_RETENTION_SECONDS = 604800  # 7 days
 # PostgreSQL provisions for replication. Fixed local-only credentials, same
 # convention as the MySQL replication user above.
 _PG_REPLICATION_USER = "rdsrepladmin"
-_PG_REPLICATION_PASSWORD = "rdsrepladmin-local-password"  # noqa: S105
+_PG_REPLICATION_PASSWORD = "rdsrepladmin-local-password"
 
 # Runs on the writer container (docker exec). Idempotently creates the
 # replication role and opens pg_hba.conf for remote replication connections:
@@ -1157,34 +1157,40 @@ def _ensure_pg_replication_source(cluster_id, cluster):
     configuration. Returns True once the writer can serve pg_basebackup
     for reader containers; False when provisioning could not run (no
     Docker, no writer container, or the exec failed) — callers retry.
+
+    The check-then-provision runs under ``_shared_container_lock`` so
+    concurrent reader workers on the same cluster provision once instead
+    of racing the flag (the script tolerates a rerun, but two interleaved
+    executions against the same writer are pointless work).
     """
-    if cluster.get("_pg_replication_source_ready"):
+    with _shared_container_lock:
+        if cluster.get("_pg_replication_source_ready"):
+            return True
+        docker_client = _get_docker()
+        container_id = cluster.get("_shared_container_id")
+        if not docker_client or not container_id:
+            return False
+        try:
+            container = docker_client.containers.get(container_id)
+            exit_code, output = container.exec_run(
+                ["sh", "-c", _PG_REPLICATION_SOURCE_SCRIPT],
+            )
+        except Exception as e:
+            logger.warning(
+                "RDS: failed to provision replication source for cluster %s: %s",
+                cluster_id, e,
+            )
+            return False
+        if exit_code != 0:
+            logger.warning(
+                "RDS: replication source provisioning for cluster %s exited %s: %s",
+                cluster_id,
+                exit_code,
+                output.decode(errors="replace") if isinstance(output, bytes) else output,
+            )
+            return False
+        cluster["_pg_replication_source_ready"] = True
         return True
-    docker_client = _get_docker()
-    container_id = cluster.get("_shared_container_id")
-    if not docker_client or not container_id:
-        return False
-    try:
-        container = docker_client.containers.get(container_id)
-        exit_code, output = container.exec_run(
-            ["sh", "-c", _PG_REPLICATION_SOURCE_SCRIPT],
-        )
-    except Exception as e:
-        logger.warning(
-            "RDS: failed to provision replication source for cluster %s: %s",
-            cluster_id, e,
-        )
-        return False
-    if exit_code != 0:
-        logger.warning(
-            "RDS: replication source provisioning for cluster %s exited %s: %s",
-            cluster_id,
-            exit_code,
-            output.decode(errors="replace") if isinstance(output, bytes) else output,
-        )
-        return False
-    cluster["_pg_replication_source_ready"] = True
-    return True
 
 
 def _start_pg_reader_container(db_id, cluster):
@@ -1265,6 +1271,14 @@ def _start_pg_reader_container(db_id, cluster):
         logger.warning(
             "RDS: failed to start reader container for %s: %s", db_id, e,
         )
+        if volume_name:
+            # Docker may have auto-created the named volume before the run
+            # failed; a leftover (possibly partially written) volume would
+            # poison a retried CreateDBInstance under the same identifier.
+            try:
+                docker_client.volumes.get(volume_name).remove()
+            except Exception:
+                pass
         return {"started": False, "failed": True}
     endpoint_host = _MINISTACK_HOST
     endpoint_port = host_port
@@ -1296,6 +1310,38 @@ def _start_pg_reader_container(db_id, cluster):
     }
 
 
+def _remove_failed_pg_reader_compute(db_id, container_id, volume_name):
+    """Remove a failed replicating reader's container and named volume.
+
+    A standby that never became reachable leaves nothing worth keeping:
+    its data directory holds at most a partial base backup, and the volume
+    name is derived from the instance identifier, so leaving either behind
+    would leak a host port and poison a retried CreateDBInstance under the
+    same identifier. Cleanup for healthy readers stays in
+    ``_delete_db_instance``; this runs only for bootstrap failures.
+    """
+    docker_client = _get_docker()
+    if not docker_client:
+        return
+    try:
+        container = docker_client.containers.get(container_id)
+        container.stop(timeout=5)
+        container.remove(v=True)
+    except Exception as e:
+        logger.warning(
+            "RDS: failed to remove container of failed reader %s: %s",
+            db_id, e,
+        )
+    if volume_name:
+        try:
+            docker_client.volumes.get(volume_name).remove()
+        except Exception as e:
+            logger.warning(
+                "RDS: failed to remove volume of failed reader %s: %s",
+                db_id, e,
+            )
+
+
 def _bg_finalize_pg_reader(
     db_id, cluster_id, engine, master_user, master_pass, db_name,
     ready_host, ready_port, container_id,
@@ -1308,7 +1354,11 @@ def _bg_finalize_pg_reader(
     until the source is provisioned). Same liveness contract as the
     generic worker: no wall clock — the instance stays ``creating`` while
     its container is up and booting, and flips to ``failed`` if the
-    container dies first.
+    container dies first. Same staleness contract as the shared-container
+    worker: if the instance record no longer points at this worker's
+    container (deleted and recreated under the same identifier), the
+    worker is superseded and must not touch the new record. A bootstrap
+    failure removes the reader's own container and volume.
     """
     def _container_alive():
         client = _get_docker()
@@ -1321,17 +1371,30 @@ def _bg_finalize_pg_reader(
         except Exception:
             return False
 
+    def _stale(instance):
+        return instance.get("_docker_container_id") != container_id
+
     while True:
         instance = _instances.get(db_id)
         cluster = _clusters.get(cluster_id)
         if instance is None or cluster is None:
             return  # deleted while bootstrapping
+        if _stale(instance):
+            return  # superseded: the recreated instance has its own worker
         if instance.get("DBInstanceStatus") == "failed":
             # Writer compute failed during creation; its readiness worker
-            # already published the failure for every member.
+            # already published the failure for every member. The standby
+            # container would retry pg_basebackup against the dead writer
+            # forever, so remove it.
+            _remove_failed_pg_reader_compute(
+                db_id, container_id, instance.get("_docker_volume_name"),
+            )
             return
         if not _container_alive():
             instance["DBInstanceStatus"] = "failed"
+            _remove_failed_pg_reader_compute(
+                db_id, container_id, instance.get("_docker_volume_name"),
+            )
             _refresh_cluster_status(cluster_id)
             return
         if cluster.get(
@@ -1346,7 +1409,7 @@ def _bg_finalize_pg_reader(
     )
     instance = _instances.get(db_id)
     cluster = _clusters.get(cluster_id)
-    if instance is None:
+    if instance is None or _stale(instance):
         return
     if not database_ready:
         logger.warning(
@@ -1354,6 +1417,9 @@ def _bg_finalize_pg_reader(
             "reachable", db_id, ready_host, ready_port,
         )
         instance["DBInstanceStatus"] = "failed"
+        _remove_failed_pg_reader_compute(
+            db_id, container_id, instance.get("_docker_volume_name"),
+        )
         _refresh_cluster_status(cluster_id)
         return
     instance["DBInstanceStatus"] = "available"
@@ -2898,15 +2964,25 @@ def _cluster_reader_endpoint(cluster):
     matching real Aurora, where the reader endpoint follows the writer in
     a single-instance cluster, but read/write because it resolves to the
     same database process as the writer.
+
+    A DBCluster advertises a single ``Port`` (the writer's, applied by
+    ``_sync_cluster_endpoints``), so a standby only reachable on a
+    different port — the host-port fallback when its network IP lookup
+    failed — must not win the ReaderEndpoint address: pairing its Address
+    with the writer's Port would be unreachable.
     """
+    shared = cluster.get("_shared_endpoint")
     for member in _cluster_member_instances(cluster):
         if (
             member.get("_pg_standby")
             and member.get("DBInstanceStatus") == "available"
             and member.get("Endpoint")
         ):
-            return member["Endpoint"]
-    return cluster.get("_shared_endpoint")
+            endpoint = member["Endpoint"]
+            if shared and endpoint.get("Port") != shared.get("Port"):
+                continue
+            return endpoint
+    return shared
 
 
 def _sync_cluster_endpoints(cluster):
