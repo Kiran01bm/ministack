@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **RDS — replicated Aurora PostgreSQL readers survive StopDBCluster / StartDBCluster and warm boot** — stopping a cluster with replicating readers was refused with `InvalidDBClusterStateFault` (the follow-up slice of #1325 the reader feature shipped without), and a MiniStack restart demoted a persisted reader to an alias of the writer's shared container. `StopDBCluster` now stops the writer's container and every reader-owned standby container — a stop that fails on any of them reports the failure instead of publishing `stopped` — and `StartDBCluster` restarts the writer, waits for it to accept authenticated connections, then revives each reader by re-cloning from the writer at its current address (reader compute owns no durable state, as on Aurora, so revival recreates rather than restarts). The same revival runs on warm boot, so a persisted reader comes back as a real hot standby with its identity, endpoint, and volume name intact; when compute cannot come back (no Docker, control-plane-only restore, or the replication flag withdrawn between runs) the member falls back to aliasing the writer instead of advertising an endpoint nothing serves. Contributed by @kiran01bm.
+
 ## [1.4.20] — 2026-08-19
 
 ### Added

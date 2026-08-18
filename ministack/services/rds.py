@@ -366,12 +366,6 @@ def restore_state(data):
             account_id, region, instance_id = key
             inst["_docker_container_id"] = None
             inst["DBInstanceStatus"] = "creating"
-            # Warm boot of per-instance reader containers is not implemented
-            # yet (#1325 slice 3). Demote a persisted replicating reader to a
-            # shared-container alias member so the restored cluster is fully
-            # usable instead of leaving a reader that points at a container
-            # the restart killed.
-            inst.pop("_pg_standby", None)
             if RDS_PERSIST:
                 inst.setdefault(
                     "_docker_volume_name",
@@ -532,6 +526,10 @@ def restore_state(data):
                 member.get("_docker_volume_name")
                 for member in members
                 if member.get("_docker_volume_name")
+                # A replicating reader's volume is live compute state
+                # (#1325), not a superseded pre-migration member volume; its
+                # revival below remounts it.
+                and not member.get("_pg_standby")
             }
             adopted_volume = cluster.get("_shared_volume_name")
             if not adopted_volume and writer is not None:
@@ -688,10 +686,22 @@ def restore_state(data):
             if result.get("started"):
                 status = "creating"
             for member in members:
+                if (
+                    member.get("_pg_standby")
+                    and not result.get("started")
+                    and not result.get("failed")
+                ):
+                    # Control-plane-only restore: no reader container is
+                    # coming back, so the member falls back to aliasing the
+                    # writer (#1325).
+                    _demote_pg_standby_to_alias(
+                        member, cluster, "no cluster compute on warm boot",
+                    )
                 _attach_instance_to_shared_cluster(member, cluster)
                 member["DBInstanceStatus"] = status
             _sync_cluster_endpoints(cluster)
 
+            standbys_to_revive = []
             if result.get("started"):
                 container_id = cluster.get("_shared_container_id")
                 container_epoch = result.get("container_epoch")
@@ -807,11 +817,23 @@ def restore_state(data):
                         member = _instances.get(
                             current_member.get("DBInstanceIdentifier"),
                         )
-                        if member is not None:
-                            _attach_instance_to_shared_cluster(member, cluster)
-                            member["DBInstanceStatus"] = status
+                        if member is None:
+                            continue
+                        if member.get("_pg_standby") and authenticated_ready:
+                            # A replicating reader's compute is revived
+                            # outside the lock below (#1325); the writer
+                            # becoming ready does not make a reader whose
+                            # container the host restart killed available.
+                            standbys_to_revive.append(member)
+                            continue
+                        _attach_instance_to_shared_cluster(member, cluster)
+                        member["DBInstanceStatus"] = status
                     _sync_cluster_endpoints(cluster)
                     _refresh_cluster_status(cluster_id)
+                for member in standbys_to_revive:
+                    _revive_pg_reader(
+                        member["DBInstanceIdentifier"], member, cluster,
+                    )
             else:
                 cluster["_shared_container_ready"] = status == "available"
 
@@ -1390,6 +1412,12 @@ def _bg_finalize_pg_reader(
                 db_id, container_id, instance.get("_docker_volume_name"),
             )
             return
+        if cluster.get("Status") == "stopped":
+            # StopDBCluster stopped this standby's container along with the
+            # writer's. That is a parked reader, not a dead one: its
+            # container and volume are preserved, and StartDBCluster revives
+            # it with a fresh worker.
+            return
         if not _container_alive():
             instance["DBInstanceStatus"] = "failed"
             _remove_failed_pg_reader_compute(
@@ -1430,6 +1458,121 @@ def _bg_finalize_pg_reader(
         "RDS: replicating reader %s ready at %s:%s", db_id,
         ready_host, ready_port,
     )
+
+
+def _demote_pg_standby_to_alias(instance, cluster, reason):
+    """Demote a replicating reader to a shared-container alias member.
+
+    The fallback when a reader's per-instance compute cannot come (or come
+    back): the member stays usable through the writer's shared container —
+    the flag-off behavior — instead of advertising an endpoint no container
+    serves.
+    """
+    instance.pop("_pg_standby", None)
+    _attach_instance_to_shared_cluster(instance, cluster)
+    logger.warning(
+        "RDS: demoted replicating reader %s to a shared-container alias "
+        "member: %s",
+        instance.get("DBInstanceIdentifier"), reason,
+    )
+
+
+def _revive_pg_reader(db_id, instance, cluster):
+    """Recreate a replicating reader's compute after StopDBCluster →
+    StartDBCluster or a warm boot (#1325 slice 3).
+
+    Reader compute is stateless — as in real Aurora, where reader instances
+    own no durable storage — so revival recreates the container and
+    re-clones from the writer instead of restarting the stopped one. A
+    restarted container would re-run its bootstrap with the writer address
+    baked into its environment at creation, which the writer's own restart
+    may have changed; recreation always targets the writer's current
+    address. Falls back to shared-container aliasing when per-instance
+    replication cannot run here, and marks the instance ``failed`` when the
+    launch genuinely failed.
+    """
+    cluster_id = cluster["DBClusterIdentifier"]
+    if not _pg_cluster_replication_enabled(cluster):
+        # The opt-in can be withdrawn between runs; a persisted standby must
+        # not outlive the flag that created it.
+        _demote_pg_standby_to_alias(
+            instance, cluster,
+            "MINISTACK_RDS_PG_CLUSTER_REPLICATION is off",
+        )
+        instance["DBInstanceStatus"] = "available"
+        _sync_cluster_endpoints(cluster)
+        _refresh_cluster_status(cluster_id)
+        return
+    docker_client = _get_docker()
+    if docker_client:
+        # Free the reserved container name (and the recorded container, if
+        # different) before relaunching under the same identifier. The old
+        # standby's data is at most a stale clone, so removal loses nothing.
+        identifiers = []
+        recorded = instance.get("_docker_container_id")
+        if recorded and recorded != cluster.get("_shared_container_id"):
+            identifiers.append(recorded)
+        reserved_name = _rds_docker_name(db_id)
+        if reserved_name not in identifiers:
+            identifiers.append(reserved_name)
+        for identifier in identifiers:
+            try:
+                stale = docker_client.containers.get(identifier)
+            except Exception:
+                continue
+            try:
+                stale.remove(force=True, v=False)
+            except Exception as e:
+                logger.warning(
+                    "RDS: failed to remove stale reader container %s for "
+                    "%s: %s", identifier, db_id, e,
+                )
+    launch = _start_pg_reader_container(db_id, cluster)
+    if launch is None:
+        _demote_pg_standby_to_alias(
+            instance, cluster,
+            "per-instance replication cannot run here",
+        )
+        instance["DBInstanceStatus"] = "available"
+        _sync_cluster_endpoints(cluster)
+        _refresh_cluster_status(cluster_id)
+        return
+    if not launch.get("started"):
+        instance["DBInstanceStatus"] = "failed"
+        _refresh_cluster_status(cluster_id)
+        return
+    instance.update({
+        "Endpoint": {
+            "Address": launch["endpoint_host"],
+            "Port": int(launch["endpoint_port"]),
+            "HostedZoneId": (instance.get("Endpoint") or {}).get(
+                "HostedZoneId", "Z2R2ITUGPM61AM",
+            ),
+        },
+        "_HostPort": launch.get("host_port"),
+        "_docker_container_id": launch.get("container_id"),
+        "_docker_volume_name": (
+            launch.get("volume_name") or instance.get("_docker_volume_name")
+        ),
+        "_internal_address": launch.get("internal_host"),
+        "_internal_port": launch.get("internal_port"),
+        "DBInstanceStatus": "creating",
+    })
+    ctx = contextvars.copy_context()
+    threading.Thread(
+        target=ctx.run,
+        args=(
+            _bg_finalize_pg_reader, db_id, cluster_id,
+            cluster.get("Engine", "aurora-postgresql"),
+            cluster.get("MasterUsername", "admin"),
+            cluster.get("_MasterUserPassword", "password"),
+            cluster.get("DatabaseName") or "mydb",
+            launch.get("readiness_host"),
+            launch.get("readiness_port"),
+            launch.get("container_id"),
+        ),
+        daemon=True,
+    ).start()
 
 
 def _stop_cluster_shared_container(cluster_id, cluster):
@@ -5238,6 +5381,12 @@ def _start_db_cluster(p):
         cluster["_shared_container_ready"] = True
         cluster["Status"] = "available"
         for inst in member_instances:
+            if inst.get("_pg_standby"):
+                # No compute is coming back, so no standby container will
+                # serve this member's endpoint (#1325).
+                _demote_pg_standby_to_alias(
+                    inst, cluster, "no cluster compute on StartDBCluster",
+                )
             inst["DBInstanceStatus"] = "available"
         return _xml(200, "StartDBClusterResponse",
             f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
@@ -5279,6 +5428,10 @@ def _start_db_cluster(p):
         cluster["_shared_container_ready"] = True
         cluster["Status"] = "available"
         for inst in member_instances:
+            if inst.get("_pg_standby"):
+                _demote_pg_standby_to_alias(
+                    inst, cluster, "no cluster compute on StartDBCluster",
+                )
             inst["DBInstanceStatus"] = "available"
         return _xml(200, "StartDBClusterResponse",
             f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
@@ -5305,6 +5458,7 @@ def _start_db_cluster(p):
         cluster = _clusters.get(cluster_id)
         if not cluster:
             return
+        standbys_to_revive = []
 
         def _container_alive():
             client = _get_docker()
@@ -5417,6 +5571,13 @@ def _start_db_cluster(p):
                     )
                 cluster["_shared_container_ready"] = True
                 for inst in _cluster_member_instances(cluster):
+                    if inst.get("_pg_standby"):
+                        # A replicating reader's compute is revived outside
+                        # the lock below (#1325); the writer becoming ready
+                        # does not make a reader whose container is still
+                        # stopped available.
+                        standbys_to_revive.append(inst)
+                        continue
                     _attach_instance_to_shared_cluster(inst, cluster)
                     inst["DBInstanceStatus"] = "available"
                 _sync_cluster_endpoints(cluster)
@@ -5427,6 +5588,8 @@ def _start_db_cluster(p):
                 cluster_id,
             )
             return
+        for inst in standbys_to_revive:
+            _revive_pg_reader(inst["DBInstanceIdentifier"], inst, cluster)
         logger.info("RDS: cluster %s started and ready", cluster_id)
 
     threading.Thread(target=ctx.run, args=(_bg_start_ready,), daemon=True).start()
@@ -5452,22 +5615,6 @@ def _stop_db_cluster(p):
             "InvalidDBClusterStateFault",
             f"DbCluster {cluster.get('DBClusterIdentifier', cluster_id)} is "
             f"in {status} state but expected it to be one of available.",
-            400,
-        )
-    if any(
-        inst.get("_pg_standby") for inst in _cluster_member_instances(cluster)
-    ):
-        # Restarting per-instance reader containers after a stop is not
-        # implemented yet (#1325 slice 3). Refusing here beats the two bad
-        # alternatives: an ``available`` reader whose container is exited,
-        # or a cluster wedged in ``creating`` because a member never
-        # becomes available again.
-        return _error(
-            "InvalidDBClusterStateFault",
-            "StopDBCluster is not supported for clusters with replicating "
-            "reader instances yet; delete the reader instances first "
-            "(MINISTACK_RDS_PG_CLUSTER_REPLICATION, "
-            "https://github.com/ministackorg/ministack/issues/1325).",
             400,
         )
     if not _stop_cluster_shared_container(
