@@ -5491,6 +5491,129 @@ def _stop_db_cluster(p):
         f"<StopDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StopDBClusterResult>")
 
 
+def _failover_db_cluster(p):
+    """Force an intra-cluster failover: promote a reader member to writer.
+
+    Metadata-only for now, mirroring ``_failover_global_cluster``: the member
+    ``IsClusterWriter`` flags flip and the response reports the transitional
+    ``failing-over`` cluster status (the stored status stays ``available``,
+    as a follow-up DescribeDBClusters observes on AWS once the failover
+    completes). Data-plane promotion of a replicating reader container is a
+    follow-up (#1325); with today's shared-container clusters every member
+    already points at the same process, so there is nothing to re-point.
+
+    Error fidelity notes (wire codes from the RDS service model):
+    - unknown cluster: ``DBClusterNotFoundFault`` (404)
+    - cluster not ``available`` / no reader to promote:
+      ``InvalidDBClusterStateFault`` (400)
+    - target problems: ``InvalidDBInstanceState`` (400) — the instance-level
+      code omits the ``Fault`` suffix, like ``DBInstanceAlreadyExists``
+      (#1297); a target that exists nowhere is ``DBInstanceNotFound`` (404).
+    """
+    cluster_id = _p(p, "DBClusterIdentifier")
+    cluster = _resolve_cluster_in_request_region(cluster_id)
+    if not cluster:
+        wrong_region = _invalid_cluster_identifier_error(cluster_id)
+        if wrong_region:
+            return wrong_region
+        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+    cluster_id = cluster.get("DBClusterIdentifier", cluster_id)
+    status = cluster.get("Status")
+    if status != "available":
+        return _error(
+            "InvalidDBClusterStateFault",
+            f"DbCluster {cluster_id} is in {status} state but expected it to "
+            "be one of available.",
+            400,
+        )
+    if cluster.get("_shared_legacy_migration_in_progress") or cluster.get(
+        "_shared_legacy_migration_blocked",
+    ):
+        # restore_state's one-time legacy-storage migration reads
+        # IsClusterWriter to pick which member's volume becomes the
+        # cluster's adopted shared state; flipping the flag mid-migration
+        # could make it adopt a reader's volume. Same gate as
+        # CreateDBInstance's cluster-member path.
+        return _error(
+            "InvalidDBClusterStateFault",
+            f"Cannot failover DB cluster {cluster_id} while legacy shared-"
+            "storage migration is in progress.",
+            400,
+        )
+
+    members = cluster.get("DBClusterMembers", [])
+    readers = [m for m in members if not m.get("IsClusterWriter")]
+
+    target_id = _p(p, "TargetDBInstanceIdentifier")
+    if target_id:
+        target = next(
+            (m for m in members if m.get("DBInstanceIdentifier") == target_id),
+            None,
+        )
+        if not target:
+            if not _resolve_instance(target_id):
+                return _error(
+                    "DBInstanceNotFound", f"DBInstance {target_id} not found.", 404)
+            return _error(
+                "InvalidDBInstanceState",
+                f"DBInstance {target_id} is not a member of DB cluster "
+                f"{cluster_id}.",
+                400,
+            )
+        if target.get("IsClusterWriter"):
+            return _error(
+                "InvalidDBInstanceState",
+                f"DBInstance {target_id} is already the writer of DB cluster "
+                f"{cluster_id}; specify a reader instance to promote.",
+                400,
+            )
+        target_instance = _resolve_instance(target_id)
+        if target_instance is None:
+            # A member with no backing instance record cannot happen today
+            # (deletion unregisters the member synchronously), but promoting
+            # a phantom would strand the cluster; refuse defensively.
+            return _error(
+                "DBInstanceNotFound", f"DBInstance {target_id} not found.", 404)
+        if target_instance.get("DBInstanceStatus") != "available":
+            return _error(
+                "InvalidDBInstanceState",
+                f"DBInstance {target_id} is in "
+                f"{target_instance.get('DBInstanceStatus')} state but expected "
+                "it to be one of available.",
+                400,
+            )
+    else:
+        # AWS promotes the best candidate from the lowest promotion tier;
+        # within a tier Ministack keeps member order (no instance sizing).
+        def _promotable(member):
+            inst = _resolve_instance(member.get("DBInstanceIdentifier", ""))
+            return inst is not None and inst.get("DBInstanceStatus") == "available"
+
+        candidates = sorted(
+            (m for m in readers if _promotable(m)),
+            key=lambda m: int(m.get("PromotionTier", 1)),
+        )
+        if not candidates:
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"Cannot failover DB cluster {cluster_id} because it has no "
+                "available reader instance to promote.",
+                400,
+            )
+        target = candidates[0]
+        target_id = target["DBInstanceIdentifier"]
+
+    for member in members:
+        member["IsClusterWriter"] = (
+            member.get("DBInstanceIdentifier") == target_id
+        )
+
+    response_cluster = copy.deepcopy(cluster)
+    response_cluster["Status"] = "failing-over"
+    return _xml(200, "FailoverDBClusterResponse",
+        f"<FailoverDBClusterResult><DBCluster>{_cluster_xml(response_cluster)}</DBCluster></FailoverDBClusterResult>")
+
+
 # ---------------------------------------------------------------------------
 # Option Groups
 # ---------------------------------------------------------------------------
@@ -6887,6 +7010,7 @@ _ACTION_MAP = {
     "ModifyDBCluster": _modify_db_cluster,
     "StartDBCluster": _start_db_cluster,
     "StopDBCluster": _stop_db_cluster,
+    "FailoverDBCluster": _failover_db_cluster,
     "CreateDBSnapshot": _create_db_snapshot,
     "DeleteDBSnapshot": _delete_db_snapshot,
     "DescribeDBSnapshots": _describe_db_snapshots,

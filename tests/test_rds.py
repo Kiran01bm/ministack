@@ -2595,6 +2595,265 @@ def test_rds_instance_ops_rejected_while_cluster_stopped(monkeypatch):
         m._clusters.clear()
 
 
+def _build_failover_cluster(m, cluster_id, members):
+    """Create a cluster and member instances (Docker-free) for failover tests.
+
+    ``members`` is an iterable of ``(db_instance_id, promotion_tier)``; the
+    first member becomes the writer, matching ``_register_instance_in_cluster``.
+    """
+    m._create_db_cluster({
+        "DBClusterIdentifier": cluster_id,
+        "Engine": "aurora-mysql",
+        "MasterUsername": "admin",
+        "MasterUserPassword": "password123",
+    })
+    for db_id, tier in members:
+        m._create_db_instance({
+            "DBInstanceIdentifier": db_id,
+            "DBClusterIdentifier": cluster_id,
+            "DBInstanceClass": "db.r6g.large",
+            "Engine": "aurora-mysql",
+            "PromotionTier": str(tier),
+        })
+
+
+def _cluster_writer_flags(cluster):
+    return {
+        m["DBInstanceIdentifier"]: m["IsClusterWriter"]
+        for m in cluster["DBClusterMembers"]
+    }
+
+
+def test_rds_failover_db_cluster_promotes_lowest_tier_reader(monkeypatch):
+    """Automatic failover promotes the available reader with the lowest tier."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        _build_failover_cluster(m, "failover-auto-cluster", [
+            ("failover-auto-writer", 1),
+            ("failover-auto-tier2", 2),
+            ("failover-auto-tier0", 0),
+        ])
+        cluster = m._clusters.get("failover-auto-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-auto-cluster",
+        })
+        assert status == 200
+        assert b"FailoverDBClusterResponse" in body
+        # The response reports the transitional state; the stored cluster is
+        # already through it, as a follow-up DescribeDBClusters observes.
+        assert b"<Status>failing-over</Status>" in body
+        assert cluster["Status"] == "available"
+
+        flags = _cluster_writer_flags(cluster)
+        assert flags == {
+            "failover-auto-writer": False,
+            "failover-auto-tier2": False,
+            "failover-auto-tier0": True,
+        }
+
+        # An unavailable reader must never be promoted: with tier-1 stopped,
+        # the next failover picks the remaining available reader.
+        m._instances.get("failover-auto-writer")["DBInstanceStatus"] = "stopped"
+        status, _, _body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-auto-cluster",
+        })
+        assert status == 200
+        flags = _cluster_writer_flags(cluster)
+        assert flags == {
+            "failover-auto-writer": False,
+            "failover-auto-tier2": True,
+            "failover-auto-tier0": False,
+        }
+        assert sum(flags.values()) == 1
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_failover_db_cluster_tier_tie_keeps_member_order(monkeypatch):
+    """A same-tier tie promotes the earlier member, as documented.
+
+    The automatic path relies on ``sorted()`` stability for the "within a
+    tier Ministack keeps member order" contract; this pins it so a refactor
+    to an unstable ordering (or a reordered candidates build) is caught.
+    """
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        _build_failover_cluster(m, "failover-tie-cluster", [
+            ("failover-tie-writer", 0),
+            ("failover-tie-reader-a", 1),
+            ("failover-tie-reader-b", 1),
+        ])
+        cluster = m._clusters.get("failover-tie-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+
+        status, _, _body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-tie-cluster",
+        })
+        assert status == 200
+        flags = _cluster_writer_flags(cluster)
+        assert flags == {
+            "failover-tie-writer": False,
+            "failover-tie-reader-a": True,
+            "failover-tie-reader-b": False,
+        }
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_failover_db_cluster_explicit_target_validation(monkeypatch):
+    """Explicit targets are validated: member, non-writer, and available."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        _build_failover_cluster(m, "failover-target-cluster", [
+            ("failover-target-writer", 1),
+            ("failover-target-reader", 1),
+        ])
+        m._create_db_instance({
+            "DBInstanceIdentifier": "failover-target-standalone",
+            "DBInstanceClass": "db.t3.micro",
+            "Engine": "mysql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        cluster = m._clusters.get("failover-target-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-target-cluster",
+            "TargetDBInstanceIdentifier": "failover-target-reader",
+        })
+        assert status == 200
+        assert _cluster_writer_flags(cluster) == {
+            "failover-target-writer": False,
+            "failover-target-reader": True,
+        }
+
+        # The freshly promoted writer is not a valid target.
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-target-cluster",
+            "TargetDBInstanceIdentifier": "failover-target-reader",
+        })
+        assert status == 400
+        assert b"InvalidDBInstanceState" in body
+
+        # An instance that exists but belongs to no cluster is not a target.
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-target-cluster",
+            "TargetDBInstanceIdentifier": "failover-target-standalone",
+        })
+        assert status == 400
+        assert b"InvalidDBInstanceState" in body
+
+        # A target that exists nowhere is DBInstanceNotFound (404).
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-target-cluster",
+            "TargetDBInstanceIdentifier": "failover-target-missing",
+        })
+        assert status == 404
+        assert b"DBInstanceNotFound" in body
+
+        # A member reader that is not available cannot be promoted.
+        m._instances.get("failover-target-writer")["DBInstanceStatus"] = "rebooting"
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-target-cluster",
+            "TargetDBInstanceIdentifier": "failover-target-writer",
+        })
+        assert status == 400
+        assert b"InvalidDBInstanceState" in body
+        # The failed attempts left the writer flags untouched.
+        assert _cluster_writer_flags(cluster) == {
+            "failover-target-writer": False,
+            "failover-target-reader": True,
+        }
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_failover_db_cluster_cluster_state_errors(monkeypatch):
+    """Missing, non-available, and reader-less clusters are rejected."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-missing-cluster",
+        })
+        assert status == 404
+        assert b"DBClusterNotFoundFault" in body
+
+        # A writer-only cluster has nothing to promote.
+        _build_failover_cluster(m, "failover-solo-cluster", [
+            ("failover-solo-writer", 1),
+        ])
+        cluster = m._clusters.get("failover-solo-cluster")
+        assert _poll_until(lambda: cluster["Status"] == "available")
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-solo-cluster",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+
+        # All readers unavailable is the same fault.
+        _build_failover_cluster(m, "failover-downed-cluster", [
+            ("failover-downed-writer", 1),
+            ("failover-downed-reader", 1),
+        ])
+        downed = m._clusters.get("failover-downed-cluster")
+        assert _poll_until(lambda: downed["Status"] == "available")
+        m._instances.get("failover-downed-reader")["DBInstanceStatus"] = "stopped"
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-downed-cluster",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+
+        # An in-flight legacy-storage migration is rejected: restore_state
+        # reads IsClusterWriter to pick the adopted volume, so the flag must
+        # not flip mid-migration.
+        downed["_shared_legacy_migration_in_progress"] = True
+        m._instances.get("failover-downed-reader")["DBInstanceStatus"] = (
+            "available"
+        )
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-downed-cluster",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert b"legacy shared-storage migration" in body
+        downed.pop("_shared_legacy_migration_in_progress", None)
+
+        # A stopped cluster is rejected before member checks.
+        m._stop_db_cluster({"DBClusterIdentifier": "failover-solo-cluster"})
+        assert cluster["Status"] == "stopped"
+        status, _, body = m._failover_db_cluster({
+            "DBClusterIdentifier": "failover-solo-cluster",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
 def test_rds_stop_db_cluster_docker_failure_surfaces_error(monkeypatch):
     """A failed Docker stop must not report the cluster as stopped."""
     from ministack.services import rds as m
@@ -6264,6 +6523,62 @@ def test_failover_global_cluster_missing_global_validated_before_parameter_combo
             Switchover=True,
         )
     assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
+
+
+def test_failover_db_cluster_promotes_reader_over_the_wire():
+    """FailoverDBCluster is routable end to end and flips the writer flags."""
+    east = _regional_rds("us-east-1")
+    suffix = uuid.uuid4().hex[:8]
+    cluster_id = f"failover-wire-{suffix}"
+    writer_id = f"failover-wire-writer-{suffix}"
+    reader_id = f"failover-wire-reader-{suffix}"
+
+    try:
+        east.create_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            Engine="aurora-mysql",
+            MasterUsername="admin",
+            MasterUserPassword="password123",
+        )
+        for db_id in (writer_id, reader_id):
+            east.create_db_instance(
+                DBInstanceIdentifier=db_id,
+                DBClusterIdentifier=cluster_id,
+                DBInstanceClass="db.t3.micro",
+                Engine="aurora-mysql",
+            )
+            _wait_for_rds(east, db_id)
+
+        response = east.failover_db_cluster(
+            DBClusterIdentifier=cluster_id,
+            TargetDBInstanceIdentifier=reader_id,
+        )["DBCluster"]
+        assert response["Status"] == "failing-over"
+        members = {
+            m["DBInstanceIdentifier"]: m["IsClusterWriter"]
+            for m in response["DBClusterMembers"]
+        }
+        assert members == {writer_id: False, reader_id: True}
+
+        cluster = east.describe_db_clusters(
+            DBClusterIdentifier=cluster_id,
+        )["DBClusters"][0]
+        assert cluster["Status"] == "available"
+        members = {
+            m["DBInstanceIdentifier"]: m["IsClusterWriter"]
+            for m in cluster["DBClusterMembers"]
+        }
+        assert members == {writer_id: False, reader_id: True}
+
+        with pytest.raises(ClientError) as exc:
+            east.failover_db_cluster(
+                DBClusterIdentifier=f"failover-wire-missing-{suffix}",
+            )
+        assert exc.value.response["Error"]["Code"] == "DBClusterNotFoundFault"
+    finally:
+        _delete_instance(east, reader_id)
+        _delete_instance(east, writer_id)
+        _delete_cluster(east, cluster_id)
 
 
 def test_create_global_cluster_rejects_already_attached_source_cluster():
