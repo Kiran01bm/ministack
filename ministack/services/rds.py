@@ -4120,6 +4120,15 @@ def _modify_db_instance(p):
             400,
         )
 
+    engine_version = _p(p, "EngineVersion")
+    engine_version_error = _unsupported_aurora_engine_version_error(
+        instance.get("Engine"),
+        engine_version,
+        current_version=instance.get("EngineVersion"),
+    )
+    if engine_version_error:
+        return engine_version_error
+
     apply_immediately = _p(p, "ApplyImmediately") == "true"
 
     field_map = {
@@ -4393,6 +4402,11 @@ def _create_db_cluster(p):
     engine_version = explicit_engine_version or _default_engine_version(engine)
     if global_cluster:
         expected_engine_version = global_cluster.get("EngineVersion")
+        inherited_version_error = _unsupported_aurora_engine_version_error(
+            engine, expected_engine_version
+        )
+        if inherited_version_error:
+            return inherited_version_error
         if (
             explicit_engine_version
             and expected_engine_version
@@ -4830,8 +4844,18 @@ def _modify_db_cluster(p):
             "in the same request.",
             400,
         )
-    if _p(p, "EngineVersion"):
-        cluster["EngineVersion"] = _p(p, "EngineVersion")
+    engine_version = _p(p, "EngineVersion")
+    engine_version_error = _unsupported_aurora_engine_version_error(
+        cluster.get("Engine"), engine_version,
+        current_version=cluster.get("EngineVersion"),
+    )
+    if engine_version_error:
+        return engine_version_error
+    global_version_conflict = _global_member_engine_version_conflict_error(
+        cluster, engine_version
+    )
+    if global_version_conflict:
+        return global_version_conflict
     if _p(p, "MasterUserPassword"):
         if cluster.get("MasterUserSecret"):
             return _error(
@@ -4882,6 +4906,8 @@ def _modify_db_cluster(p):
                 400,
             )
         _apply_cluster_master_password_change(cluster, new_pass)
+    if engine_version:
+        cluster["EngineVersion"] = engine_version
     if _p(p, "Port"):
         cluster["Port"] = int(_p(p, "Port"))
     if _p(p, "BackupRetentionPeriod"):
@@ -6260,18 +6286,26 @@ def _create_global_cluster(p):
                 f"global cluster {existing_global_id}.",
                 400,
             )
-        if (
-            _aurora_mysql_8_replication_enabled(source_cluster)
-            and not _prepare_mysql_gtid_history(source_cluster)
-        ):
-            return _error(
-                "InvalidDBClusterStateFault",
-                "The source cluster volume predates GTID-at-creation tracking "
-                "and cannot safely become a global writer.",
-                400,
-            )
         engine = source_cluster["Engine"]
         engine_version = source_cluster["EngineVersion"]
+
+    # Validate before _prepare_mysql_gtid_history runs: a rejected version
+    # must not leave GTID markers on the source cluster when no global
+    # cluster is created.
+    engine_version_error = _unsupported_aurora_engine_version_error(engine, engine_version)
+    if engine_version_error:
+        return engine_version_error
+
+    if source_cluster is not None and (
+        _aurora_mysql_8_replication_enabled(source_cluster)
+        and not _prepare_mysql_gtid_history(source_cluster)
+    ):
+        return _error(
+            "InvalidDBClusterStateFault",
+            "The source cluster volume predates GTID-at-creation tracking "
+            "and cannot safely become a global writer.",
+            400,
+        )
 
     gc = {
         "GlobalClusterIdentifier": gc_id,
@@ -6408,6 +6442,14 @@ def _modify_global_cluster(p):
         return _error("GlobalClusterNotFoundFault",
             f"Global cluster {gc_id} not found.", 404)
 
+    engine_version = _p(p, "EngineVersion")
+    engine_version_error = _unsupported_aurora_engine_version_error(
+        gc.get("Engine"), engine_version,
+        current_version=gc.get("EngineVersion"),
+    )
+    if engine_version_error:
+        return engine_version_error
+
     new_id = _p(p, "NewGlobalClusterIdentifier")
     if new_id and new_id != gc_id:
         invalid_new_id = _invalid_global_cluster_identifier_error(new_id)
@@ -6428,8 +6470,14 @@ def _modify_global_cluster(p):
 
     if _p(p, "DeletionProtection"):
         gc["DeletionProtection"] = _p(p, "DeletionProtection") == "true"
-    if _p(p, "EngineVersion"):
-        gc["EngineVersion"] = _p(p, "EngineVersion")
+    if engine_version:
+        # Real AWS applies a global-database version change through
+        # ModifyGlobalCluster and propagates it to every member cluster.
+        gc["EngineVersion"] = engine_version
+        for member in gc.get("GlobalClusterMembers", []):
+            member_cluster = _resolve_cluster(member["DBClusterArn"])
+            if member_cluster:
+                member_cluster["EngineVersion"] = engine_version
 
     return _xml(200, "ModifyGlobalClusterResponse",
         f"<ModifyGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></ModifyGlobalClusterResult>")
@@ -7228,7 +7276,8 @@ def _default_engine_version(engine):
     return defaults.get(engine, "15.3")
 
 
-def _unsupported_aurora_engine_version_error(engine, engine_version):
+def _unsupported_aurora_engine_version_error(engine, engine_version, *,
+                                             current_version=None):
     supported = {
         "aurora-mysql": AURORA_MYSQL_ENGINE_VERSION_SET,
         "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSION_SET,
@@ -7242,9 +7291,62 @@ def _unsupported_aurora_engine_version_error(engine, engine_version):
     # the major, so the running database matches what the prefix requested.
     if any(version.startswith(engine_version + ".") for version in supported):
         return None
+    if current_version:
+        # Modify paths report the upgrade-target shape real AWS uses when the
+        # requested version is not a reachable target from the stored one.
+        return _error(
+            "InvalidParameterCombination",
+            f"Cannot find upgrade target from {current_version} with "
+            f"requested version {engine_version}.",
+            400,
+        )
     return _error(
         "InvalidParameterCombination",
         f"Cannot find version {engine_version} for {engine}",
+        400,
+    )
+
+
+def _aurora_major_series(engine, engine_version):
+    """Comparable major series for an Aurora engine version.
+
+    aurora-postgresql majors are the first dotted segment ("16.8" -> "16").
+    aurora-mysql majors are the Aurora series after the community head
+    ("8.0.mysql_aurora.3.10.3" -> "3"); a bare community head such as the
+    accepted "8.0" prefix carries no series, so it returns None.
+    """
+    if not engine_version:
+        return None
+    if engine == "aurora-mysql":
+        if ".mysql_aurora." not in engine_version:
+            return None
+        return engine_version.split(".mysql_aurora.", 1)[1].split(".")[0] or None
+    return engine_version.split(".")[0] or None
+
+
+def _global_member_engine_version_conflict_error(cluster, engine_version):
+    """Reject a member version change that diverges from its global cluster.
+
+    Real AWS applies major version changes of a global database through
+    ModifyGlobalCluster, which propagates to every member; per-member minor
+    upgrades are allowed. Without this check a member could be moved to a
+    different major than its global, a combination CreateDBCluster already
+    refuses to produce.
+    """
+    gc_id = cluster.get("GlobalClusterIdentifier")
+    if not engine_version or not gc_id:
+        return None
+    gc = _resolve_global_cluster(gc_id)
+    gc_version = (gc or {}).get("EngineVersion")
+    engine = cluster.get("Engine")
+    requested_major = _aurora_major_series(engine, engine_version)
+    global_major = _aurora_major_series(engine, gc_version)
+    if not requested_major or not global_major or requested_major == global_major:
+        return None
+    return _error(
+        "InvalidParameterValue",
+        f"EngineVersion {engine_version} is incompatible with global "
+        f"cluster {gc_id} engine version {gc_version}.",
         400,
     )
 
