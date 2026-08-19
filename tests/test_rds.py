@@ -2447,14 +2447,109 @@ def test_rds_stop_db_cluster_allows_sole_global_member(monkeypatch):
         m._clusters.clear()
 
 
-def test_rds_start_recreate_reconfigures_mysql_replication(monkeypatch):
-    """Recreated compute re-establishes its global MySQL replication role."""
+def test_rds_stop_db_cluster_postgres_fails_closed_on_missing_backref(monkeypatch):
+    """Global membership guards are engine-agnostic and fail closed."""
+    from ministack.services import rds as m
+
+    stopped = []
+    monkeypatch.setattr(
+        m, "_stop_cluster_shared_container",
+        lambda *args: stopped.append(args) or True,
+    )
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "postgres-global-primary",
+            "Engine": "aurora-postgresql",
+        })
+        cluster = m._clusters["postgres-global-primary"]
+        cluster["Status"] = "available"
+        cluster["GlobalClusterIdentifier"] = "postgres-global"
+        m._global_clusters["postgres-global"] = {
+            "GlobalClusterIdentifier": "postgres-global",
+            # Deliberately omit this cluster's ARN to exercise a stale
+            # GlobalClusterMembers back-reference.
+            "GlobalClusterMembers": [
+                {"DBClusterArn": "arn:aws:rds:us-west-2:0:cluster:secondary"},
+                {"DBClusterArn": "arn:aws:rds:eu-west-1:0:cluster:tertiary"},
+            ],
+        }
+
+        status, _, body = m._stop_db_cluster({
+            "DBClusterIdentifier": "postgres-global-primary",
+        })
+
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert stopped == []
+    finally:
+        m._global_clusters.clear()
+        m._clusters.clear()
+
+
+def test_rds_start_db_cluster_global_membership_guard(monkeypatch):
+    """Start refuses multi-member globals but allows a sole member."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "global-start-primary",
+            "Engine": "aurora-mysql",
+        })
+        cluster = m._clusters["global-start-primary"]
+        cluster["Status"] = "stopped"
+        cluster["GlobalClusterIdentifier"] = "global-start"
+        global_cluster = {
+            "GlobalClusterIdentifier": "global-start",
+            "GlobalClusterMembers": [
+                m._global_cluster_member(cluster, True),
+                {"DBClusterArn": "arn:aws:rds:us-west-2:0:cluster:secondary"},
+            ],
+        }
+        m._global_clusters["global-start"] = global_cluster
+
+        status, _, body = m._start_db_cluster({
+            "DBClusterIdentifier": "global-start-primary",
+        })
+        assert status == 400
+        assert b"InvalidDBClusterStateFault" in body
+        assert cluster["Status"] == "stopped"
+
+        global_cluster["GlobalClusterMembers"] = [
+            m._global_cluster_member(cluster, True),
+        ]
+        status, _, body = m._start_db_cluster({
+            "DBClusterIdentifier": "global-start-primary",
+        })
+        assert status == 200, body
+        assert cluster["Status"] == "available"
+    finally:
+        m._global_clusters.clear()
+        m._clusters.clear()
+
+
+@pytest.mark.parametrize(
+    ("recreate", "legacy_volume", "expected_reset", "expected_status"),
+    [
+        (True, False, True, "available"),
+        (False, False, None, "available"),
+        (True, True, True, "failed"),
+    ],
+)
+def test_rds_start_reconfigures_global_mysql_replication(
+    monkeypatch, recreate, legacy_volume, expected_reset, expected_status,
+):
+    """Start relinks global MySQL with the right recreated-container state."""
     from ministack.services import rds as m
 
     docker, _container, state = _stop_start_fake_docker(
         m._rds_cluster_docker_name("recreated-global-cluster"),
     )
-    replication_calls = []
+    replication_states = []
     monkeypatch.setattr(m, "_get_docker", lambda: docker)
     monkeypatch.setattr(m, "_get_ministack_network", lambda _client: None)
     monkeypatch.setattr(m, "_next_port", lambda: 16076)
@@ -2462,14 +2557,32 @@ def test_rds_start_recreate_reconfigures_mysql_replication(monkeypatch):
     monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args: True)
     monkeypatch.setattr(m, "_ensure_mysql_compatibility", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", lambda *_args: None)
-    monkeypatch.setattr(m, "_aurora_mysql_8_replication_enabled", lambda _cluster: True)
+    original_configure = m._configure_or_defer_mysql_replication
+
+    def configure_inner(_cluster_id, cluster):
+        if legacy_volume:
+            cluster["_shared_container_ready"] = False
+            m._set_cluster_members_status(cluster, "failed")
+        return None
+
+    def capture_configure(cluster_id, cluster):
+        replication_states.append((
+            cluster.get("_shared_container_epoch"),
+            cluster.get("_shared_container_ready"),
+            cluster.get("_mysql_replication_reset_pending"),
+        ))
+        return original_configure(cluster_id, cluster)
+
+    monkeypatch.setattr(m, "_configure_mysql_replication", configure_inner)
     monkeypatch.setattr(
         m,
         "_configure_or_defer_mysql_replication",
-        lambda cluster_id, cluster: replication_calls.append((cluster_id, cluster)),
+        capture_configure,
     )
 
+    m._instances.clear()
     m._clusters.clear()
+    m._global_clusters.clear()
     try:
         m._create_db_cluster({
             "DBClusterIdentifier": "recreated-global-cluster",
@@ -2484,18 +2597,44 @@ def test_rds_start_recreate_reconfigures_mysql_replication(monkeypatch):
         cluster["_shared_container_id"] = docker.containers.get(
             m._rds_cluster_docker_name("recreated-global-cluster"),
         ).id
-        replication_calls.clear()
-        state["fail_start"] = True
+        cluster["DBClusterMembers"] = [{
+            "DBInstanceIdentifier": "recreated-global-instance",
+            "IsClusterWriter": True,
+        }]
+        m._instances["recreated-global-instance"] = {
+            "DBInstanceIdentifier": "recreated-global-instance",
+            "DBInstanceStatus": "stopped",
+        }
+        global_cluster = {
+            "GlobalClusterIdentifier": "recreated-global",
+            "GlobalClusterMembers": [m._global_cluster_member(cluster, True)],
+        }
+        m._global_clusters["recreated-global"] = global_cluster
+        cluster["GlobalClusterIdentifier"] = "recreated-global"
+        state["fail_start"] = recreate
 
         status, _, _body = m._start_db_cluster({
             "DBClusterIdentifier": "recreated-global-cluster",
         })
 
         assert status == 200
-        assert _poll_until(lambda: cluster["Status"] == "available")
-        assert replication_calls == [("recreated-global-cluster", cluster)]
+        assert _poll_until(
+            lambda: m._instances["recreated-global-instance"][
+                "DBInstanceStatus"
+            ] == expected_status,
+        )
+        assert replication_states == [(
+            cluster["_shared_container_epoch"],
+            True,
+            expected_reset,
+        )]
+        assert m._instances["recreated-global-instance"][
+            "DBInstanceStatus"
+        ] == expected_status
     finally:
+        m._global_clusters.clear()
         m._clusters.clear()
+        m._instances.clear()
 
 
 def test_rds_start_db_cluster_accepts_cluster_arn(monkeypatch):
@@ -8547,6 +8686,80 @@ def test_rds_deleting_last_global_secondary_instance_preserves_headless_applier(
         assert secondary["_mysql_headless_applier_required"] is True
     finally:
         set_request_region(original_region)
+        m._instances.clear()
+        m._clusters.clear()
+        m._global_clusters.clear()
+
+
+def test_rds_deleting_last_global_primary_instance_preserves_compute(monkeypatch):
+    """A global writer keeps compute while secondaries still depend on it."""
+    from ministack.core.responses import get_account_id
+    from ministack.services import rds as m
+
+    account_id = get_account_id()
+    writer, secondary, _writer_member, _secondary_member, global_cluster = (
+        _mysql_replication_unit_topology()
+    )
+    writer.update({
+        "DBClusterMembers": [{
+            "DBInstanceIdentifier": "primary-writer",
+            "IsClusterWriter": True,
+        }],
+        "_shared_storage_initialized": True,
+        "_shared_container_id": "primary-container",
+    })
+    instance = {
+        "DBInstanceIdentifier": "primary-writer",
+        "DBInstanceClass": "db.r6g.large",
+        "Engine": "aurora-mysql",
+        "EngineVersion": DEFAULT_AURORA_MYSQL_ENGINE_VERSION,
+        "DBInstanceStatus": "available",
+        "MasterUsername": "admin",
+        "AllocatedStorage": 1,
+        "DBInstanceArn": f"arn:aws:rds:us-east-1:{account_id}:db:primary-writer",
+        "DBClusterIdentifier": "primary",
+        "_shared_cluster_id": "primary",
+        "DeletionProtection": False,
+    }
+    stopped = []
+    secondary_state = {
+        key: secondary.get(key)
+        for key in (
+            "_shared_container_ready",
+            "_mysql_replication_source_arn",
+            "_mysql_replication_reset_pending",
+        )
+    }
+
+    m._instances.clear()
+    m._clusters.clear()
+    m._global_clusters.clear()
+    try:
+        m._clusters.set_scoped(account_id, "us-east-1", "primary", writer)
+        m._clusters.set_scoped(account_id, "us-west-2", "secondary", secondary)
+        m._instances.set_scoped(
+            account_id, "us-east-1", "primary-writer", instance,
+        )
+        m._global_clusters["global-repl"] = global_cluster
+        monkeypatch.setattr(
+            m,
+            "_stop_cluster_shared_container",
+            lambda cluster_id, cluster: stopped.append((cluster_id, cluster)),
+        )
+
+        status, _, body = m._delete_db_instance({
+            "DBInstanceIdentifier": "primary-writer",
+            "SkipFinalSnapshot": "true",
+        })
+
+        assert status == 200, body
+        assert stopped == []
+        assert writer["DBClusterMembers"] == []
+        assert writer["_shared_container_id"] == "primary-container"
+        assert {
+            key: secondary.get(key) for key in secondary_state
+        } == secondary_state
+    finally:
         m._instances.clear()
         m._clusters.clear()
         m._global_clusters.clear()
