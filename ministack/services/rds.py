@@ -831,9 +831,13 @@ def restore_state(data):
                     _sync_cluster_endpoints(cluster)
                     _refresh_cluster_status(cluster_id)
                 for member in standbys_to_revive:
-                    _revive_pg_reader(
+                    if not _revive_pg_reader(
                         member["DBInstanceIdentifier"], member, cluster,
-                    )
+                    ):
+                        # The failed revival landed the cluster back on
+                        # stopped; reviving further standbys would race
+                        # that transition.
+                        break
             else:
                 cluster["_shared_container_ready"] = status == "available"
 
@@ -1418,11 +1422,33 @@ def _bg_finalize_pg_reader(
             # container and volume are preserved, and StartDBCluster revives
             # it with a fresh worker.
             return
+        if cluster.get("Status") == "stopping":
+            # StopDBCluster is mid-flight. It either lands on ``stopped``
+            # (handled above on the next pass) or fails, rolls this
+            # container back to running, and restores ``available`` —
+            # keep waiting rather than mistaking the stop for a death.
+            time.sleep(1)
+            continue
+        if instance.get("DBInstanceStatus") == "stopped":
+            # A failed StopDBCluster's rollback could not restart this
+            # standby's container and parked the member instead. Preserved
+            # compute, not a bootstrap failure: a StopDBCluster retry and
+            # StartDBCluster bring it back.
+            return
         if not _container_alive():
-            instance["DBInstanceStatus"] = "failed"
-            _remove_failed_pg_reader_compute(
-                db_id, container_id, instance.get("_docker_volume_name"),
-            )
+            with _shared_container_lock:
+                # StopDBCluster stops containers while holding this lock and
+                # publishes ``stopping`` before taking it; serialize with it
+                # so a container it just stopped is not destroyed as dead.
+                current = _clusters.get(cluster_id)
+                if current is cluster and cluster.get("Status") in (
+                    "stopping", "stopped",
+                ):
+                    continue
+                instance["DBInstanceStatus"] = "failed"
+                _remove_failed_pg_reader_compute(
+                    db_id, container_id, instance.get("_docker_volume_name"),
+                )
             _refresh_cluster_status(cluster_id)
             return
         if cluster.get(
@@ -1440,14 +1466,26 @@ def _bg_finalize_pg_reader(
     if instance is None or _stale(instance):
         return
     if not database_ready:
-        logger.warning(
-            "RDS: reader container for %s at %s:%s exited before becoming "
-            "reachable", db_id, ready_host, ready_port,
-        )
-        instance["DBInstanceStatus"] = "failed"
-        _remove_failed_pg_reader_compute(
-            db_id, container_id, instance.get("_docker_volume_name"),
-        )
+        with _shared_container_lock:
+            # A stop landing while this worker was inside the readiness wait
+            # kills the container deliberately. Same park-don't-destroy rule
+            # as the pre-wait loop: the stopped container and its volume are
+            # exactly what StartDBCluster revives.
+            stop_intervened = (
+                cluster is not None
+                and _clusters.get(cluster_id) is cluster
+                and cluster.get("Status") in ("stopping", "stopped")
+            )
+            if stop_intervened or instance.get("DBInstanceStatus") == "stopped":
+                return
+            logger.warning(
+                "RDS: reader container for %s at %s:%s exited before "
+                "becoming reachable", db_id, ready_host, ready_port,
+            )
+            instance["DBInstanceStatus"] = "failed"
+            _remove_failed_pg_reader_compute(
+                db_id, container_id, instance.get("_docker_volume_name"),
+            )
         _refresh_cluster_status(cluster_id)
         return
     instance["DBInstanceStatus"] = "available"
@@ -1467,7 +1505,46 @@ def _demote_pg_standby_to_alias(instance, cluster, reason):
     back): the member stays usable through the writer's shared container —
     the flag-off behavior — instead of advertising an endpoint no container
     serves.
+
+    Demotion is also the last moment the member still references its owned
+    compute: ``_attach_instance_to_shared_cluster`` overwrites the container
+    id and nulls the volume name, so anything not removed here is orphaned —
+    and a container left holding the reserved instance name would 409 a
+    later CreateDBInstance under the same identifier. Removal is best-effort
+    (no Docker means nothing can be removed, and the stale-name sweep on
+    creation remains the backstop).
     """
+    db_id = instance.get("DBInstanceIdentifier")
+    docker_client = _get_docker()
+    if docker_client:
+        identifiers = []
+        recorded = instance.get("_docker_container_id")
+        if recorded and recorded != cluster.get("_shared_container_id"):
+            identifiers.append(recorded)
+        reserved_name = _rds_docker_name(db_id)
+        if reserved_name not in identifiers:
+            identifiers.append(reserved_name)
+        for identifier in identifiers:
+            try:
+                stale = docker_client.containers.get(identifier)
+            except Exception:
+                continue
+            try:
+                stale.remove(force=True, v=False)
+            except Exception as e:
+                logger.warning(
+                    "RDS: failed to remove container %s of demoted reader "
+                    "%s: %s", identifier, db_id, e,
+                )
+        volume_name = instance.get("_docker_volume_name")
+        if volume_name and volume_name != cluster.get("_shared_volume_name"):
+            try:
+                docker_client.volumes.get(volume_name).remove()
+            except Exception as e:
+                logger.warning(
+                    "RDS: failed to remove volume of demoted reader %s: %s",
+                    db_id, e,
+                )
     instance.pop("_pg_standby", None)
     _attach_instance_to_shared_cluster(instance, cluster)
     logger.warning(
@@ -1488,8 +1565,12 @@ def _revive_pg_reader(db_id, instance, cluster):
     baked into its environment at creation, which the writer's own restart
     may have changed; recreation always targets the writer's current
     address. Falls back to shared-container aliasing when per-instance
-    replication cannot run here, and marks the instance ``failed`` when the
-    launch genuinely failed.
+    replication cannot run here, and lands the cluster back on ``stopped``
+    when the launch genuinely failed, so the start can be retried.
+
+    Returns False when the revival failed and the caller should stop
+    reviving further standbys (the cluster has been returned to
+    ``stopped``); True otherwise.
     """
     cluster_id = cluster["DBClusterIdentifier"]
     if not _pg_cluster_replication_enabled(cluster):
@@ -1502,7 +1583,7 @@ def _revive_pg_reader(db_id, instance, cluster):
         instance["DBInstanceStatus"] = "available"
         _sync_cluster_endpoints(cluster)
         _refresh_cluster_status(cluster_id)
-        return
+        return True
     docker_client = _get_docker()
     if docker_client:
         # Free the reserved container name (and the recorded container, if
@@ -1527,6 +1608,7 @@ def _revive_pg_reader(db_id, instance, cluster):
                     "RDS: failed to remove stale reader container %s for "
                     "%s: %s", identifier, db_id, e,
                 )
+    revive_epoch = int(cluster.get("_shared_container_epoch", 0))
     launch = _start_pg_reader_container(db_id, cluster)
     if launch is None:
         _demote_pg_standby_to_alias(
@@ -1536,28 +1618,68 @@ def _revive_pg_reader(db_id, instance, cluster):
         instance["DBInstanceStatus"] = "available"
         _sync_cluster_endpoints(cluster)
         _refresh_cluster_status(cluster_id)
-        return
+        return True
     if not launch.get("started"):
-        instance["DBInstanceStatus"] = "failed"
-        _refresh_cluster_status(cluster_id)
-        return
-    instance.update({
-        "Endpoint": {
-            "Address": launch["endpoint_host"],
-            "Port": int(launch["endpoint_port"]),
-            "HostedZoneId": (instance.get("Endpoint") or {}).get(
-                "HostedZoneId", "Z2R2ITUGPM61AM",
+        # Real AWS lands a failed start back on ``stopped`` — never on a
+        # transitional status (see _fail_start in _start_db_cluster). A
+        # reader marked ``failed`` here would drive the cluster to
+        # ``creating``, where StartDBCluster and StopDBCluster are both
+        # rejected and the cluster is wedged until the instance is deleted.
+        # Instead, park the cluster's compute again and land everything back
+        # on ``stopped`` so StartDBCluster can simply be retried. The member
+        # keeps its standby identity for that retry.
+        logger.warning(
+            "RDS: failed to revive replicating reader %s; returning cluster "
+            "%s to stopped for retry", db_id, cluster_id,
+        )
+        if _stop_cluster_shared_container(cluster_id, cluster):
+            cluster["Status"] = "stopped"
+            for member in _cluster_member_instances(cluster):
+                member["DBInstanceStatus"] = "stopped"
+        else:
+            # The fail-back stop itself failed: the writer (and any
+            # already-revived reader) is still serving, so publishing
+            # ``stopped`` would lie. Keep the cluster available, publish
+            # only this member as stopped, and let the ReaderEndpoint fall
+            # back to compute that exists.
+            cluster["_shared_container_ready"] = True
+            cluster["Status"] = "available"
+            instance["DBInstanceStatus"] = "stopped"
+            _sync_cluster_endpoints(cluster)
+        return False
+    with _shared_container_lock:
+        # The Docker launch above is slow; re-verify this worker is still
+        # acting on live records (mirrors the restore and start paths). A
+        # concurrent DeleteDBInstance, cluster teardown, or Stop/Start
+        # (epoch bump) supersedes this revival: remove the just-created
+        # compute instead of publishing it onto a stale record.
+        if (
+            _instances.get(db_id) is not instance
+            or _clusters.get(cluster_id) is not cluster
+            or int(cluster.get("_shared_container_epoch", 0)) != revive_epoch
+        ):
+            _remove_failed_pg_reader_compute(
+                db_id, launch.get("container_id"), launch.get("volume_name"),
+            )
+            return True
+        instance.update({
+            "Endpoint": {
+                "Address": launch["endpoint_host"],
+                "Port": int(launch["endpoint_port"]),
+                "HostedZoneId": (instance.get("Endpoint") or {}).get(
+                    "HostedZoneId", "Z2R2ITUGPM61AM",
+                ),
+            },
+            "_HostPort": launch.get("host_port"),
+            "_docker_container_id": launch.get("container_id"),
+            "_docker_volume_name": (
+                launch.get("volume_name")
+                or instance.get("_docker_volume_name")
             ),
-        },
-        "_HostPort": launch.get("host_port"),
-        "_docker_container_id": launch.get("container_id"),
-        "_docker_volume_name": (
-            launch.get("volume_name") or instance.get("_docker_volume_name")
-        ),
-        "_internal_address": launch.get("internal_host"),
-        "_internal_port": launch.get("internal_port"),
-        "DBInstanceStatus": "creating",
-    })
+            "_internal_address": launch.get("internal_host"),
+            "_internal_port": launch.get("internal_port"),
+            "DBInstanceStatus": "creating",
+        })
     ctx = contextvars.copy_context()
     threading.Thread(
         target=ctx.run,
@@ -1573,6 +1695,7 @@ def _revive_pg_reader(db_id, instance, cluster):
         ),
         daemon=True,
     ).start()
+    return True
 
 
 def _stop_cluster_shared_container(cluster_id, cluster):
@@ -1586,8 +1709,15 @@ def _stop_cluster_shared_container(cluster_id, cluster):
     DeleteDBCluster (the container itself may be replaced if a later
     StartDBCluster has to fall back to recreating compute).
 
-    Returns True when compute is stopped — including when there was nothing
-    to stop — and False when a running container could not be stopped.
+    Returns True when all compute is stopped — including when there was
+    nothing to stop — and False when a running container could not be
+    stopped. A False return is all-or-nothing about the writer: reader
+    containers stop first and the writer's shared container last, and any
+    container this call already stopped is restarted before returning, so a
+    failed stop never leaves the writer's published ``available`` pointing
+    at exited compute. If that rollback restart itself fails, the affected
+    standby member alone is published ``stopped`` and the ReaderEndpoint is
+    re-synced away from it.
     """
     with _shared_container_lock:
         # Invalidate every readiness worker before the potentially slow Docker
@@ -1601,8 +1731,11 @@ def _stop_cluster_shared_container(cluster_id, cluster):
         docker_client = _get_docker()
         if not docker_client or not container_ids:
             return True
-        all_stopped = True
-        for container_id in container_ids:
+        stopped = []
+        # _cluster_owned_container_ids lists the shared (writer) container
+        # first; stop it last so a reader-stop failure leaves the writer
+        # untouched and only reader containers ever need rolling back.
+        for container_id in reversed(container_ids):
             try:
                 container = docker_client.containers.get(container_id)
             except Exception:
@@ -1613,6 +1746,7 @@ def _stop_cluster_shared_container(cluster_id, cluster):
                 container.reload()
                 if container.status not in ("created", "exited", "dead", "removing"):
                     container.stop(timeout=5)
+                    stopped.append(container)
                     logger.info(
                         "RDS: stopped container %s for cluster %s",
                         container_id,
@@ -1625,8 +1759,35 @@ def _stop_cluster_shared_container(cluster_id, cluster):
                     cluster_id,
                     e,
                 )
-                all_stopped = False
-        return all_stopped
+                # Partial stops must not survive a failed StopDBCluster:
+                # the caller keeps the cluster ``available``, so every
+                # container this call stopped is restarted to keep that
+                # status honest.
+                for prior in stopped:
+                    try:
+                        prior.start()
+                    except Exception as restart_error:
+                        logger.warning(
+                            "RDS: failed to restart container %s while "
+                            "rolling back a failed stop of cluster %s: %s",
+                            prior.id,
+                            cluster_id,
+                            restart_error,
+                        )
+                        # The writer stops last, so an unrestartable
+                        # container here is always a reader's. Publish that
+                        # one member as stopped and steer the
+                        # ReaderEndpoint away from its exited container.
+                        for member in _cluster_member_instances(cluster):
+                            if (
+                                member.get("_pg_standby")
+                                and member.get("_docker_container_id")
+                                == prior.id
+                            ):
+                                member["DBInstanceStatus"] = "stopped"
+                        _sync_cluster_endpoints(cluster)
+                return False
+        return True
 
 
 def _remove_cluster_shared_resources(
@@ -2697,7 +2858,7 @@ def _refresh_cluster_status(cluster_id):
     cluster = _clusters.get(cluster_id)
     if not cluster:
         return
-    if cluster.get("Status") in ("stopped", "deleting"):
+    if cluster.get("Status") in ("stopping", "stopped", "deleting"):
         return
     member_ids = {
         m.get("DBInstanceIdentifier")
@@ -2706,7 +2867,12 @@ def _refresh_cluster_status(cluster_id):
     }
     if any(
         inst.get("DBInstanceIdentifier") in member_ids
-        and inst.get("DBInstanceStatus") != "available"
+        # A member in ``stopped`` was parked deliberately (a failed
+        # StopDBCluster's rollback could not restart its container); it is
+        # not converging toward available, so it must not hold the cluster
+        # in ``creating`` — that would reject the StopDBCluster retry that
+        # repairs it.
+        and inst.get("DBInstanceStatus") not in ("available", "stopped")
         for inst in _instances.values()
     ):
         cluster["Status"] = "creating"
@@ -5373,21 +5539,42 @@ def _start_db_cluster(p):
     member_instances = _cluster_member_instances(cluster)
     docker_client = _get_docker()
     had_compute = bool(cluster.get("_shared_container_id"))
+    has_replicating_standbys = _pg_cluster_replication_enabled(cluster) and any(
+        inst.get("_pg_standby") for inst in member_instances
+    )
     if not docker_client or not (
         had_compute or cluster.get("_shared_storage_initialized")
     ):
+        if has_replicating_standbys and (
+            had_compute or cluster.get("_shared_storage_initialized")
+        ):
+            # The cluster has real compute (a standby only exists because a
+            # reader container launched) but Docker is unreachable right
+            # now — often transiently, e.g. Docker Desktop restarting.
+            # Demoting here would irreversibly discard the standby identity
+            # on a condition that may clear in seconds; fail the start and
+            # keep everything stopped so a retry can revive the reader.
+            return _error(
+                "InternalFailure",
+                f"Failed to start compute for DB cluster {cluster_id}.",
+                500,
+            )
         # Control-plane only, or the cluster never had real compute:
         # flipping the statuses is the entire start.
         cluster["_shared_container_ready"] = True
         cluster["Status"] = "available"
         for inst in member_instances:
             if inst.get("_pg_standby"):
-                # No compute is coming back, so no standby container will
-                # serve this member's endpoint (#1325).
+                # No compute is coming back — replication is switched off,
+                # or the cluster never had real compute — so no standby
+                # container will serve this member's endpoint (#1325).
                 _demote_pg_standby_to_alias(
                     inst, cluster, "no cluster compute on StartDBCluster",
                 )
             inst["DBInstanceStatus"] = "available"
+        # Demotion changes what the ReaderEndpoint should resolve to;
+        # republish it so it does not keep advertising the former standby.
+        _sync_cluster_endpoints(cluster)
         return _xml(200, "StartDBClusterResponse",
             f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
 
@@ -5424,6 +5611,19 @@ def _start_db_cluster(p):
                 f"Failed to start compute for DB cluster {cluster_id}.",
                 500,
             )
+        if has_replicating_standbys:
+            # Docker went away between the check above and the start
+            # attempt. Same reasoning as the pre-check: a transient Docker
+            # miss must not irreversibly demote a standby. Keep the cluster
+            # stopped and let a retry revive the reader.
+            cluster["Status"] = "stopped"
+            for inst in member_instances:
+                inst["DBInstanceStatus"] = "stopped"
+            return _error(
+                "InternalFailure",
+                f"Failed to start compute for DB cluster {cluster_id}.",
+                500,
+            )
         # Benign control-plane-only outcome: no Docker in this environment.
         cluster["_shared_container_ready"] = True
         cluster["Status"] = "available"
@@ -5433,6 +5633,7 @@ def _start_db_cluster(p):
                     inst, cluster, "no cluster compute on StartDBCluster",
                 )
             inst["DBInstanceStatus"] = "available"
+        _sync_cluster_endpoints(cluster)
         return _xml(200, "StartDBClusterResponse",
             f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
 
@@ -5589,7 +5790,12 @@ def _start_db_cluster(p):
             )
             return
         for inst in standbys_to_revive:
-            _revive_pg_reader(inst["DBInstanceIdentifier"], inst, cluster)
+            if not _revive_pg_reader(
+                inst["DBInstanceIdentifier"], inst, cluster,
+            ):
+                # The failed revival landed the cluster back on stopped;
+                # reviving further standbys would race that transition.
+                return
         logger.info("RDS: cluster %s started and ready", cluster_id)
 
     threading.Thread(target=ctx.run, args=(_bg_start_ready,), daemon=True).start()
@@ -5617,14 +5823,20 @@ def _stop_db_cluster(p):
             f"in {status} state but expected it to be one of available.",
             400,
         )
+    # Publish the transitional status before touching compute so concurrent
+    # reader bootstrap workers can tell a stop-in-progress from a genuinely
+    # dead container and park instead of destroying preserved compute.
+    cluster["Status"] = "stopping"
     if not _stop_cluster_shared_container(
         cluster.get("DBClusterIdentifier", cluster_id), cluster,
     ):
-        # Compute is still running; publishing ``stopped`` here would be the
+        # Compute is still running (a failed stop rolls back any container
+        # it already stopped); publishing ``stopped`` here would be the
         # reachable-endpoint lie this state machine exists to prevent.
         # Restore readiness (the container is still serving) and surface the
         # failure so StopDBCluster can be retried.
         cluster["_shared_container_ready"] = True
+        cluster["Status"] = "available"
         return _error(
             "InternalFailure",
             "Failed to stop compute for DB cluster "
