@@ -3988,12 +3988,17 @@ def _delete_db_instance(p):
     if shared_cluster_id:
         cluster = _resolve_cluster_in_request_region(shared_cluster_id)
         if cluster and not cluster.get("DBClusterMembers"):
-            if _mysql_replication_secondary(cluster):
+            global_cluster, _member = _global_cluster_member_for_cluster(cluster)
+            if (
+                global_cluster
+                and len(global_cluster.get("GlobalClusterMembers", [])) > 1
+            ):
                 # Aurora global headless secondaries have no query compute but
-                # their storage continues to synchronize.  MiniStack's single
-                # shared process is also the applier, so preserve it until the
-                # secondary is detached, deleted, or gains compute again.
-                cluster["_mysql_headless_applier_required"] = True
+                # their storage continues to synchronize. MiniStack's shared
+                # process also sustains the global topology, so preserve it
+                # for both writers and secondaries while other members exist.
+                if _mysql_replication_secondary(cluster):
+                    cluster["_mysql_headless_applier_required"] = True
             else:
                 _stop_cluster_shared_container(shared_cluster_id, cluster)
 
@@ -5535,6 +5540,19 @@ def _start_db_cluster(p):
             "stopped,inaccessible-encryption-credentials-recoverable.",
             400,
         )
+    global_cluster, _member = _global_cluster_member_for_cluster(cluster)
+    if (
+        global_cluster
+        and len(global_cluster.get("GlobalClusterMembers", [])) > 1
+    ):
+        # Message text is verbatim from the AWS Aurora global-database
+        # limitations documentation, not from a captured wire transcript.
+        return _error(
+            "InvalidDBClusterStateFault",
+            "You can only stop and start a cluster that's part of an Aurora "
+            "global database if it's the only cluster in the global database.",
+            400,
+        )
 
     member_instances = _cluster_member_instances(cluster)
     docker_client = _get_docker()
@@ -5578,6 +5596,7 @@ def _start_db_cluster(p):
         return _xml(200, "StartDBClusterResponse",
             f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
 
+    compute_recreated = False
     if had_compute:
         start_result = _restart_cluster_shared_container(cluster_id, cluster)
         if start_result.get("failed"):
@@ -5587,6 +5606,7 @@ def _start_db_cluster(p):
             start_result = _start_cluster_shared_container(
                 cluster_id, cluster, remove_stale=True,
             )
+            compute_recreated = start_result.get("started", False)
     else:
         # Initialized storage without a container id happens after a host
         # restart: persistence drops the container id but the stable-named
@@ -5594,6 +5614,7 @@ def _start_db_cluster(p):
         start_result = _start_cluster_shared_container(
             cluster_id, cluster, remove_stale=True,
         )
+        compute_recreated = start_result.get("started", False)
 
     if not start_result.get("started"):
         if start_result.get("failed"):
@@ -5655,6 +5676,7 @@ def _start_db_cluster(p):
         container_epoch=start_result.get("container_epoch"),
         ready_host=start_result.get("readiness_host"),
         ready_port=start_result.get("readiness_port"),
+        compute_recreated=compute_recreated,
     ):
         cluster = _clusters.get(cluster_id)
         if not cluster:
@@ -5771,6 +5793,18 @@ def _start_db_cluster(p):
                         cluster_id,
                     )
                 cluster["_shared_container_ready"] = True
+                if _aurora_mysql_8_replication_enabled(cluster):
+                    if compute_recreated:
+                        # A new container has a new hostname, while the
+                        # persisted replica repository and relay-log names
+                        # belong to the old container. Reset them before
+                        # changing the replication source.
+                        cluster["_mysql_replication_reset_pending"] = True
+                    _configure_or_defer_mysql_replication(cluster_id, cluster)
+                if not cluster.get("_shared_container_ready"):
+                    _sync_cluster_endpoints(cluster)
+                    _refresh_cluster_status(cluster_id)
+                    return
                 for inst in _cluster_member_instances(cluster):
                     if inst.get("_pg_standby"):
                         # A replicating reader's compute is revived outside
@@ -5821,6 +5855,20 @@ def _stop_db_cluster(p):
             "InvalidDBClusterStateFault",
             f"DbCluster {cluster.get('DBClusterIdentifier', cluster_id)} is "
             f"in {status} state but expected it to be one of available.",
+            400,
+        )
+
+    global_cluster, _member = _global_cluster_member_for_cluster(cluster)
+    if (
+        global_cluster
+        and len(global_cluster.get("GlobalClusterMembers", [])) > 1
+    ):
+        # Message text is verbatim from the AWS Aurora global-database
+        # limitations documentation, not from a captured wire transcript.
+        return _error(
+            "InvalidDBClusterStateFault",
+            "You can only stop and start a cluster that's part of an Aurora "
+            "global database if it's the only cluster in the global database.",
             400,
         )
     # Publish the transitional status before touching compute so concurrent
