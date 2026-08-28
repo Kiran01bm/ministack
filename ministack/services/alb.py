@@ -253,20 +253,49 @@ def _parse_actions(params, prefix="DefaultActions"):
     return actions
 
 
+# A rule condition carries its values either in the flat legacy ``Values`` list or
+# in a per-field typed config. The Terraform AWS provider sends the typed form, so a
+# parser that reads only ``Values`` records an empty condition, and the rule then
+# matches nothing and the listener falls through to its default action.
+_CONDITION_VALUE_KEYS = {
+    "path-pattern": "PathPatternConfig",
+    "host-header": "HostHeaderConfig",
+    "http-request-method": "HttpRequestMethodConfig",
+    "source-ip": "SourceIpConfig",
+}
+
+
+def _parse_condition_values(params, base):
+    """Read a condition's values from whichever shape the caller used."""
+    def _values_at(prefix):
+        out, j = [], 1
+        while True:
+            v = _p(params, f"{prefix}.member.{j}")
+            if not v:
+                break
+            out.append(v)
+            j += 1
+        return out
+
+    values = _values_at(f"{base}.Values")
+    if values:
+        return values
+
+    for config_key in _CONDITION_VALUE_KEYS.values():
+        values = _values_at(f"{base}.{config_key}.Values")
+        if values:
+            return values
+    return []
+
+
 def _parse_conditions(params, prefix="Conditions"):
     conditions, i = [], 1
     while True:
-        field = _p(params, f"{prefix}.member.{i}.Field")
+        base = f"{prefix}.member.{i}"
+        field = _p(params, f"{base}.Field")
         if not field:
             break
-        values, j = [], 1
-        while True:
-            v = _p(params, f"{prefix}.member.{i}.Values.member.{j}")
-            if not v:
-                break
-            values.append(v)
-            j += 1
-        conditions.append({"Field": field, "Values": values})
+        conditions.append({"Field": field, "Values": _parse_condition_values(params, base)})
         i += 1
     return conditions
 
@@ -429,13 +458,25 @@ def _listener_xml(l):
     )
 
 
+def _condition_xml(c):
+    """Render a condition the way AWS does: the flat Values list *and*, for the
+    fields that have one, the typed config carrying the same values.
+
+    A client that reads only the typed config — the Terraform provider does, for
+    path_pattern and host_header — sees an empty condition otherwise, and plans a
+    change on every run to put the values back.
+    """
+    values = c.get("Values", [])
+    members = "".join(f"<member>{v}</member>" for v in values)
+    xml = f"<member><Field>{c['Field']}</Field><Values>{members}</Values>"
+    config_key = _CONDITION_VALUE_KEYS.get(c.get("Field"))
+    if config_key:
+        xml += f"<{config_key}><Values>{members}</Values></{config_key}>"
+    return xml + "</member>"
+
+
 def _rule_xml(r):
-    conds = "".join(
-        f"<member><Field>{c['Field']}</Field>"
-        f"<Values>{''.join(f'<member>{v}</member>' for v in c.get('Values',[]))}</Values>"
-        f"</member>"
-        for c in r.get("Conditions", [])
-    )
+    conds = "".join(_condition_xml(c) for c in r.get("Conditions", []))
     acts = "".join(_action_xml(a) for a in r.get("Actions", []))
     return (
         f"<member>"
