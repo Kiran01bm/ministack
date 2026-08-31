@@ -1317,6 +1317,15 @@ def test_appsync_deleting_an_api_releases_its_cache(appsync):
     assert e.value.response["Error"]["Code"] == "NotFoundException"
 
 
+def _graphql(api_id, api_key, query, variables=None):
+    """POST a query to the API's data plane the way an SDK would."""
+    import requests as _rq
+    payload = {"query": query}
+    if variables is not None:
+        payload["variables"] = variables
+    r = _rq.post(f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
+                 headers={"x-api-key": api_key, "content-type": "application/json"},
+                 json=payload, timeout=15)
 def _graphql(api_id, api_key, query):
     """POST a query to the API's data plane the way an SDK would."""
     import requests as _rq
@@ -1885,6 +1894,99 @@ def test_appsync_js_aliased_utils_import_binds(appsync):
     got = _graphql(api_id, key, '{ ping }')["data"]["ping"]
     assert got["id"] == 36
     assert got["hasRuntime"] == "function"
+
+
+_GC_SDL = """
+type Thing { id: ID! label: String owner: String }
+type Query { getThing(id: ID!): Thing echo(n: Int): Int }
+type Mutation { makeThing(input: MakeInput!): Thing }
+input MakeInput { label: String! }
+schema { query: Query mutation: Mutation }
+"""
+
+
+def _gc_api(appsync, name):
+    api_id, key = _js_api(appsync, name)
+    appsync.start_schema_creation(apiId=api_id, definition=_GC_SDL.encode())
+    _js_resolver(appsync, api_id, "getThing", """
+        export function request(ctx) { return { payload: { id: ctx.args.id } } }
+        export function response(ctx) { return ctx.result }
+    """)
+    appsync.create_resolver(
+        apiId=api_id, typeName="Thing", fieldName="label", dataSourceName="DS",
+        runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+        code="""
+            export function request(ctx) { return { payload: 'L-' + ctx.source.id } }
+            export function response(ctx) { return ctx.result }
+        """)
+    return api_id, key
+
+
+def test_appsync_graphql_field_alias(appsync):
+    """`a: getThing(...)` — the response is keyed by the alias, not the field."""
+    api_id, key = _gc_api(appsync, "qa-gc-alias")
+    out = _graphql(api_id, key, '{ a: getThing(id: "t1") { id } }')
+    assert out["data"]["a"]["id"] == "t1", out
+
+
+def test_appsync_graphql_fragments(appsync):
+    """A named fragment and an inline fragment both contribute their fields."""
+    api_id, key = _gc_api(appsync, "qa-gc-frag")
+    out = _graphql(api_id, key, """
+        { getThing(id: "t1") { ...F ... on Thing { label } } }
+        fragment F on Thing { id }
+    """)
+    assert out["data"]["getThing"]["id"] == "t1", out
+    assert out["data"]["getThing"]["label"] == "L-t1", out
+
+
+def test_appsync_graphql_skip_and_include_directives(appsync):
+    """@skip and @include decide whether a field is in the response at all."""
+    api_id, key = _gc_api(appsync, "qa-gc-directives")
+    out = _graphql(api_id, key,
+                   'query($yes: Boolean!, $no: Boolean!) '
+                   '{ getThing(id: "t1") { id label @include(if: $no) owner @skip(if: $yes) } }',
+                   {"yes": True, "no": False})
+    thing = out["data"]["getThing"]
+    assert "label" not in thing, f"@include(if: false) must omit the field: {thing}"
+    assert "owner" not in thing, f"@skip(if: true) must omit the field: {thing}"
+
+
+def test_appsync_graphql_rejects_an_invalid_query(appsync):
+    """A query naming a field the schema does not have is refused, not executed."""
+    api_id, key = _gc_api(appsync, "qa-gc-validate")
+    out = _graphql(api_id, key, '{ getThing(id: "t1") { nope } }')
+    assert out.get("errors"), "an invalid selection must be an error"
+    assert "nope" in out["errors"][0]["message"]
+    assert not (out.get("data") or {}).get("getThing")
+
+
+def test_appsync_graphql_introspection(appsync):
+    """__schema is how every client and codegen tool starts."""
+    api_id, key = _gc_api(appsync, "qa-gc-introspect")
+    out = _graphql(api_id, key, '{ __schema { queryType { name } } }')
+    assert out["data"]["__schema"]["queryType"]["name"] == "Query", out
+
+
+def test_appsync_graphql_variable_defaults_and_coercion(appsync):
+    """A variable default applies, and values coerce to the declared type."""
+    api_id, key = _gc_api(appsync, "qa-gc-vars")
+    _js_resolver(appsync, api_id, "echo", """
+        export function request(ctx) { return { payload: ctx.args.n } }
+        export function response(ctx) { return ctx.result }
+    """)
+    out = _graphql(api_id, key, 'query($n: Int = 42) { echo(n: $n) }')
+    assert out["data"]["echo"] == 42, out
+
+
+def test_appsync_js_function_early_return_continues_the_pipeline(appsync):
+    """earlyReturn in a FUNCTION skips its data source and response — and the
+    pipeline continues to the next function.
+
+    AWS: "the data source and response handler are skipped, and the next
+    function request handler (or the pipeline resolver response handler if this
+    was the last AWS AppSync function) is called."
+
 def test_appsync_js_function_early_return_continues_the_pipeline(appsync):
     """earlyReturn in a FUNCTION skips its data source and response — and the
     pipeline continues to the next function.
@@ -1912,6 +2014,7 @@ def test_appsync_js_function_early_return_continues_the_pipeline(appsync):
             export function request(ctx) { ctx.stash.result = 'SECOND_RAN'; return { payload: 1 } }
             export function response(ctx) { return ctx.result }
         """)["functionConfiguration"]["functionId"]
+
     appsync.create_resolver(
         apiId=api_id, typeName="Query", fieldName="chain", kind="PIPELINE",
         runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
@@ -1923,6 +2026,12 @@ def test_appsync_js_function_early_return_continues_the_pipeline(appsync):
     out = _graphql(api_id, key, '{ chain }')
     assert out["data"]["chain"] == "SECOND_RAN", \
         f"a function's earlyReturn must not end the pipeline: {out}"
+
+
+def test_appsync_js_resolver_early_return_still_runs_the_response(appsync):
+    """earlyReturn in the pipeline RESOLVER's request skips the functions, and
+    the resolver's own response handler still runs.
+
 def test_appsync_js_resolver_early_return_still_runs_the_response(appsync):
     """earlyReturn in the pipeline RESOLVER's request skips the functions, and
     the resolver's own response handler still runs.
@@ -1951,6 +2060,8 @@ def test_appsync_js_resolver_early_return_still_runs_the_response(appsync):
     out = _graphql(api_id, key, '{ chain }')
     assert out["data"]["chain"] == "RESPONSE_RAN", \
         f"the resolver's response must still run, and the functions must not: {out}"
+
+
 def test_appsync_js_early_return_skip_to_end(appsync):
     """skipTo: 'END' from a function skips the rest of the pipeline and goes
     straight to the resolver's response handler."""
@@ -1982,6 +2093,8 @@ def test_appsync_js_early_return_skip_to_end(appsync):
         """)
     out = _graphql(api_id, key, '{ chain }')
     assert out["data"]["chain"] == "ENDED", f"skipTo END must stop the pipeline: {out}"
+
+
 def test_appsync_js_pipeline_response_sees_ctx_result(appsync):
     """A pipeline resolver's response handler gets ctx.result as well as
     ctx.prev.result — AWS documents result as "available only to response
@@ -2003,6 +2116,12 @@ def test_appsync_js_pipeline_response_sees_ctx_result(appsync):
             export function response(ctx) { return ctx.result.v }
         """)
     assert _graphql(api_id, key, '{ chain }')["data"]["chain"] == "FROM_FUNCTION"
+
+
+def test_appsync_js_lambda_datasource_receives_the_payload_verbatim(appsync, lam):
+    """A JS resolver returning {operation: 'Invoke', payload} sends exactly that
+    payload as the Lambda event.
+
 def test_appsync_js_lambda_datasource_receives_the_payload_verbatim(appsync, lam):
     """A JS resolver returning {operation: 'Invoke', payload} sends exactly that
     payload as the Lambda event.
@@ -2013,11 +2132,13 @@ def test_appsync_js_lambda_datasource_receives_the_payload_verbatim(appsync, lam
     """
     import io
     import zipfile
+
     def _zip(src):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as z:
             z.writestr("index.py", src)
         return buf.getvalue()
+
     code = _zip(
         "def handler(e, c):\n"
         "    # Echo the event back so the test can see exactly what arrived.\n"
@@ -2051,3 +2172,97 @@ def test_appsync_js_lambda_datasource_receives_the_payload_verbatim(appsync, lam
     got = _graphql(api_id, key, '{ echo }')["data"]["echo"]
     assert got == {"text": ["a", "b"]}, \
         f"the payload must arrive verbatim, not wrapped in a resolver event: {got}"
+
+
+@pytest.mark.skipif(
+    os.environ.get("APPSYNC_ENFORCE_AUTH", "0") in ("0", "", "false", "False"),
+    reason="enforcement is opt-in; run the server with APPSYNC_ENFORCE_AUTH=1")
+def test_appsync_cognito_api_refuses_an_unauthenticated_request(appsync, cognito_idp):
+    """An API whose auth mode is AMAZON_COGNITO_USER_POOLS refuses a caller with
+    no credentials.
+
+    ministack already refuses an unknown API key on this path, so an API that
+    declares Cognito should likewise not serve an anonymous caller — otherwise
+    every authorization test passes locally regardless of what the resolvers do,
+    which is the opposite of useful.
+    """
+    pool = cognito_idp.create_user_pool(PoolName="qa-authmode-pool")["UserPool"]
+    api = appsync.create_graphql_api(
+        name="qa-authmode", authenticationType="AMAZON_COGNITO_USER_POOLS",
+        userPoolConfig={"userPoolId": pool["Id"], "awsRegion": "us-east-1",
+                        "defaultAction": "ALLOW"},
+    )["graphqlApi"]
+    api_id = api["apiId"]
+    appsync.create_data_source(apiId=api_id, name="DS", type="NONE")
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="secret", dataSourceName="DS",
+        runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+        code="""
+            export function request(ctx) { return { payload: 'LEAKED' } }
+            export function response(ctx) { return ctx.result }
+        """)
+
+    import requests as _rq
+    r = _rq.post(f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
+                 headers={"content-type": "application/json"},
+                 json={"query": "{ secret }"}, timeout=15)
+    assert r.status_code == 401, f"expected 401, got {r.status_code} {r.text[:200]}"
+    assert "LEAKED" not in r.text
+
+
+def test_appsync_schemaless_api_keeps_lenient_execution(ddb):
+    """An API with no schema is executed leniently, exactly as before.
+
+    Validation is a per-API property that appears when a schema does: parsing
+    always happens, but a query is only checked against a schema once one has
+    been uploaded. Every API created before StartSchemaCreation existed is
+    schemaless, so validating those would start rejecting queries that work
+    today — this pins that it does not.
+    """
+    import json
+    import urllib.request
+    from conftest import make_client
+
+    appsync = make_client("appsync")
+
+    ddb.create_table(
+        TableName="schemaless-users",
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+
+    api = appsync.create_graphql_api(
+        name="schemaless-api", authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]
+
+    appsync.create_data_source(
+        apiId=api_id, name="usersDS", type="AMAZON_DYNAMODB",
+        dynamodbConfig={"tableName": "schemaless-users", "awsRegion": "us-east-1"},
+    )
+    appsync.create_resolver(
+        apiId=api_id, typeName="Mutation", fieldName="createUser",
+        dataSourceName="usersDS",
+    )
+
+    # No StartSchemaCreation call — this API has no schema at all.
+    assert not appsync.get_graphql_api(apiId=api_id)["graphqlApi"].get("_schema")
+
+    def _post(query):
+        req = urllib.request.Request(
+            f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
+            data=json.dumps({"query": query}).encode(),
+            headers={"Content-Type": "application/json", "x-api-key": key["id"]},
+        )
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read())
+
+    body = _post('mutation { createUser(input: {id: "u1", name: "Ada"}) { id name } }')
+    assert "errors" not in body, body
+    assert body["data"]["createUser"]["id"] == "u1", body
+
+    # The decisive half: with a schema this field would be a validation error
+    # before any resolver ran. Schemaless, it must still reach the resolver.
+    body = _post('mutation { createUser(input: {id: "u2", nope: 1}) { id } }')
+    assert body.get("data", {}).get("createUser", {}).get("id") == "u2", body

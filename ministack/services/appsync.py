@@ -267,6 +267,8 @@ def _delete_graphql_api(api_id):
     _functions.pop(api_id, None)
     _schemas.pop(api_id, None)
     _caches.pop(api_id, None)
+    from ministack.core import appsync_graphql
+    appsync_graphql.forget_schema(api_id)
     _cache_entries.pop(api_id, None)
     _tags.pop(arn, None)
 
@@ -560,6 +562,8 @@ def _start_schema_creation(api_id, body):
     elif isinstance(definition, (bytes, bytearray)):
         definition = definition.decode("utf-8", "replace")
 
+    from ministack.core import appsync_graphql
+    appsync_graphql.forget_schema(api_id)
     _schemas[api_id] = {
         "definition": definition,
         "status": "SUCCESS",
@@ -1153,6 +1157,9 @@ def reset():
     _caches.clear()
     _cache_entries.clear()
     # Drop the JS worker so its compiled-module cache does not outlive a reset.
+    from ministack.core import appsync_graphql, appsync_js
+    appsync_js.reset()
+    appsync_graphql.forget_schema()
     from ministack.core import appsync_js
     appsync_js.reset()
     _tags.clear()
@@ -1368,6 +1375,110 @@ def _unauthorized_response():
     })
 
 
+# Off by default: ministack has no authentication of its own by design, and a
+# suite written against the permissive behaviour would start failing. Set
+# APPSYNC_ENFORCE_AUTH=1 to have an API refuse a caller that satisfies none of
+# its configured providers, the way AWS does — which is what makes an
+# authorization test meaningful.
+_ENFORCE_AUTH = os.environ.get("APPSYNC_ENFORCE_AUTH", "0") not in ("0", "", "false", "False")
+
+
+def _auth_modes(api):
+    """Every authentication type the API accepts."""
+    modes = {api.get("authenticationType") or "API_KEY"}
+    for extra in api.get("additionalAuthenticationProviders") or []:
+        t = extra.get("authenticationType") if isinstance(extra, dict) else extra
+        if t:
+            modes.add(t)
+    return modes
+
+
+def _request_is_authenticated(api_id, api, request_headers):
+    """Whether the request satisfies any of the API's configured providers.
+
+    AppSync accepts a request if any one provider accepts it. Credentials are
+    not verified here — ministack issued these tokens and does not check
+    signatures — but a request carrying nothing at all matches no provider, and
+    that is the case worth refusing: it is the one that makes an authorization
+    test pass no matter what the resolvers do.
+    """
+    headers = {str(k).lower(): v for k, v in (request_headers or {}).items()}
+    modes = _auth_modes(api)
+    auth = str(headers.get("authorization") or "")
+
+    if "API_KEY" in modes:
+        supplied = headers.get("x-api-key")
+        if supplied and supplied in (_api_keys.get(api_id) or {}):
+            return True
+    if {"AMAZON_COGNITO_USER_POOLS", "OPENID_CONNECT"} & modes:
+        # A bearer token, as distinct from a SigV4 credential.
+        if auth and not auth.startswith("AWS4-HMAC-SHA256"):
+            return True
+    if "AWS_IAM" in modes and auth.startswith("AWS4-HMAC-SHA256"):
+        return True
+    if "AWS_LAMBDA" in modes and api.get("lambdaAuthorizerConfig"):
+        # The authorizer runs below and may still reject.
+        return True
+    return False
+
+
+def _execute_with_schema(api_id, sdl, query, variables, operation_name, request_headers):
+    """Execute against the API's schema with the real GraphQL algorithm."""
+    from ministack.core import appsync_graphql
+
+    api = _apis.get(api_id, {})
+    identity = None
+    if api.get("userPoolConfig"):
+        identity = _cognito_identity(api, request_headers)
+    if api.get("lambdaAuthorizerConfig"):
+        try:
+            identity = _invoke_lambda_authorizer(
+                api_id, api["lambdaAuthorizerConfig"], request_headers,
+                query=query, variables=variables, operation_name=operation_name)
+        except _AuthorizerRejected:
+            return _unauthorized_response()
+
+    appended = []
+
+    def field_resolver(source, info, **args):
+        """Called for every field graphql-core resolves."""
+        type_name = info.parent_type.name
+        field_name = info.field_name
+
+        resolver = (_resolvers.get(api_id) or {}).get(type_name, {}).get(field_name)
+        if resolver is None:
+            # No resolver on this field: read it off the parent, which is how
+            # AppSync resolves a plain attribute of a returned object.
+            if isinstance(source, dict):
+                return source.get(field_name)
+            return getattr(source, field_name, None)
+
+        return _resolve_field(
+            api_id, resolver, args, [], variables,
+            field_name=field_name,
+            identity=identity,
+            request_headers=request_headers,
+            source=source if isinstance(source, dict) else {},
+            appended_errors=appended,
+            type_name=type_name,
+        )
+
+    try:
+        data, errors = appsync_graphql.execute(
+            api_id, sdl, query, variables, operation_name, field_resolver, None)
+    except appsync_graphql.SchemaUnavailable as exc:
+        return _json(200, {"data": None, "errors": [{"message": str(exc)}]})
+
+    # util.appendError is non-fatal and rides alongside the data.
+    for a in appended:
+        errors.append({"message": a.get("message"), "errorType": a.get("errorType")})
+
+    body = {"data": data}
+    if errors:
+        body["errors"] = errors
+    return _json(200, body)
+
+
 def _execute_graphql(api_id, data, request_headers=None):
     """Execute a GraphQL query/mutation against the configured resolvers."""
     query = data.get("query", "")
@@ -1379,6 +1490,20 @@ def _execute_graphql(api_id, data, request_headers=None):
 
     if api_id not in _apis:
         return _json(404, {"errors": [{"message": f"API {api_id} not found"}]})
+
+    # Applied before either execution path, so it does not depend on whether the
+    # API has a schema.
+    if _ENFORCE_AUTH and not _request_is_authenticated(
+            api_id, _apis.get(api_id, {}), request_headers or {}):
+        return _unauthorized_response()
+
+    # A schema means the real engine: parse, validate, execute. The regex path
+    # below is kept only for an API that has no schema yet, where there is
+    # nothing to validate against.
+    sdl = (_schemas.get(api_id) or {}).get("definition")
+    if sdl:
+        return _execute_with_schema(
+            api_id, sdl, query, variables, operation_name, request_headers or {})
 
     # Parse the top-level operation
     # Strip __typename fields — Amplify adds these everywhere
