@@ -963,3 +963,440 @@ def test_appsync_lambda_failing_authorizer_returns_unauthorized(appsync, lam):
                                             _APPSYNC_IDENTITY_PROBE_RESOLVER)
     _appsync_expect_unauthorized(url, "{ testField { hasIdentity } }",
                                  headers={"Authorization": "Bearer fake-jwt"})
+
+
+SDL = """type Query {
+  hello: String
+}
+schema { query: Query }
+"""
+
+
+def test_appsync_schema_creation_and_introspection():
+    """StartSchemaCreation stores the SDL; the status polls to SUCCESS and it reads back."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="schema-api", authenticationType="API_KEY")["graphqlApi"]
+
+    started = appsync.start_schema_creation(apiId=api["apiId"], definition=SDL.encode())
+    assert started["status"] in ("PROCESSING", "SUCCESS")
+
+    status = appsync.get_schema_creation_status(apiId=api["apiId"])
+    assert status["status"] == "SUCCESS"
+
+    schema = appsync.get_introspection_schema(apiId=api["apiId"], format="SDL")
+    assert schema["schema"].read().decode() == SDL
+
+
+def test_appsync_schema_creation_status_without_a_schema():
+    """An API that has never had a schema reports NOT_APPLICABLE rather than failing."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="noschema-api", authenticationType="API_KEY")["graphqlApi"]
+    assert appsync.get_schema_creation_status(apiId=api["apiId"])["status"] == "NOT_APPLICABLE"
+
+
+def test_appsync_pipeline_function_crud():
+    """Create, get, list, update and delete a pipeline function."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="fn-api", authenticationType="API_KEY")["graphqlApi"]
+    appsync.create_data_source(apiId=api["apiId"], name="NoneDS", type="NONE")
+
+    created = appsync.create_function(
+        apiId=api["apiId"], name="fnOne", dataSourceName="NoneDS",
+        functionVersion="2018-05-29",
+        runtime={"name": "APPSYNC_JS", "runtimeVersion": "1.0.0"},
+        code="export function request(ctx){return {};} export function response(ctx){return ctx.result;}",
+    )["functionConfiguration"]
+    assert created["name"] == "fnOne"
+    assert created["functionId"]
+    assert created["functionArn"].endswith(f"/functions/{created['functionId']}")
+    assert created["runtime"]["name"] == "APPSYNC_JS"
+
+    got = appsync.get_function(apiId=api["apiId"], functionId=created["functionId"])
+    assert got["functionConfiguration"]["name"] == "fnOne"
+
+    listed = appsync.list_functions(apiId=api["apiId"])["functions"]
+    assert [f["functionId"] for f in listed] == [created["functionId"]]
+
+    updated = appsync.update_function(
+        apiId=api["apiId"], functionId=created["functionId"],
+        name="fnOneRenamed", dataSourceName="NoneDS", functionVersion="2018-05-29",
+    )["functionConfiguration"]
+    assert updated["name"] == "fnOneRenamed"
+    assert updated["functionId"] == created["functionId"]
+
+    appsync.delete_function(apiId=api["apiId"], functionId=created["functionId"])
+    assert appsync.list_functions(apiId=api["apiId"])["functions"] == []
+
+
+def test_appsync_pipeline_resolver_referencing_functions():
+    """A PIPELINE resolver keeps the function ids it was created with.
+
+    This is the shape Terraform produces: functions first, then a resolver whose
+    pipelineConfig lists their ids.
+    """
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="pipe-api", authenticationType="API_KEY")["graphqlApi"]
+    appsync.start_schema_creation(apiId=api["apiId"], definition=SDL.encode())
+    appsync.create_data_source(apiId=api["apiId"], name="NoneDS", type="NONE")
+
+    ids = [
+        appsync.create_function(
+            apiId=api["apiId"], name=f"step{i}", dataSourceName="NoneDS",
+            functionVersion="2018-05-29",
+        )["functionConfiguration"]["functionId"]
+        for i in range(2)
+    ]
+
+    resolver = appsync.create_resolver(
+        apiId=api["apiId"], typeName="Query", fieldName="hello",
+        kind="PIPELINE", pipelineConfig={"functions": ids},
+    )["resolver"]
+    assert resolver["kind"] == "PIPELINE"
+    assert resolver["pipelineConfig"]["functions"] == ids
+
+
+def test_appsync_graphql_api_environment_variables():
+    """Environment variables round-trip, and a put replaces the whole map."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="env-api", authenticationType="API_KEY")["graphqlApi"]
+
+    assert appsync.get_graphql_api_environment_variables(apiId=api["apiId"])["environmentVariables"] == {}
+
+    put = appsync.put_graphql_api_environment_variables(
+        apiId=api["apiId"], environmentVariables={"FEATURE": "on", "TIER": "local"},
+    )["environmentVariables"]
+    assert put == {"FEATURE": "on", "TIER": "local"}
+
+    got = appsync.get_graphql_api_environment_variables(apiId=api["apiId"])["environmentVariables"]
+    assert got == {"FEATURE": "on", "TIER": "local"}
+
+    # AWS replaces rather than merges
+    replaced = appsync.put_graphql_api_environment_variables(
+        apiId=api["apiId"], environmentVariables={"ONLY": "this"},
+    )["environmentVariables"]
+    assert replaced == {"ONLY": "this"}
+
+
+def test_appsync_update_data_source_and_resolver():
+    """Terraform re-applies an existing API by updating in place, not recreating."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="upd-api", authenticationType="API_KEY")["graphqlApi"]
+    appsync.start_schema_creation(apiId=api["apiId"], definition=SDL.encode())
+    appsync.create_data_source(apiId=api["apiId"], name="DS", type="NONE", description="first")
+
+    updated = appsync.update_data_source(
+        apiId=api["apiId"], name="DS", type="NONE", description="second",
+    )["dataSource"]
+    assert updated["description"] == "second"
+    assert appsync.get_data_source(apiId=api["apiId"], name="DS")["dataSource"]["description"] == "second"
+
+    appsync.create_resolver(
+        apiId=api["apiId"], typeName="Query", fieldName="hello", dataSourceName="DS",
+    )
+    appsync.update_resolver(
+        apiId=api["apiId"], typeName="Query", fieldName="hello", dataSourceName="DS",
+        kind="PIPELINE", pipelineConfig={"functions": []},
+    )
+    got = appsync.get_resolver(apiId=api["apiId"], typeName="Query", fieldName="hello")["resolver"]
+    assert got["kind"] == "PIPELINE"
+
+
+def test_appsync_update_api_key():
+    """UpdateApiKey changes the description without minting a new key."""
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="key-api", authenticationType="API_KEY")["graphqlApi"]
+    key = appsync.create_api_key(apiId=api["apiId"], description="before")["apiKey"]
+
+    updated = appsync.update_api_key(
+        apiId=api["apiId"], id=key["id"], description="after",
+    )["apiKey"]
+    assert updated["id"] == key["id"]
+    assert updated["description"] == "after"
+
+
+def test_appsync_graphql_api_reports_server_side_defaults():
+    """apiType and visibility must come back, or a Terraform plan forces replacement.
+
+    Both are ForceNew in the AWS provider, so an API that omits them reads as
+    needing to be recreated on every plan — taking every datasource, function and
+    resolver with it.
+    """
+    from conftest import make_client
+    appsync = make_client("appsync")
+    api = appsync.create_graphql_api(name="defaults-api", authenticationType="API_KEY")["graphqlApi"]
+    assert api["apiType"] == "GRAPHQL"
+    assert api["visibility"] == "GLOBAL"
+    assert api["introspectionConfig"] == "ENABLED"
+
+    got = appsync.get_graphql_api(apiId=api["apiId"])["graphqlApi"]
+    assert got["apiType"] == "GRAPHQL"
+    assert got["visibility"] == "GLOBAL"
+
+
+def test_appsync_delete_api_removes_functions_and_schema():
+    """Deleting an API must drop its functions and schema from the stores.
+
+    Asserted against the stores directly: every read path checks the API exists
+    first, so going through the API would report NotFoundException whether or not
+    the child state was actually released.
+    """
+    import json as _json_mod
+
+    from ministack.services import appsync as _appsync
+
+    resp = _appsync._create_graphql_api({"name": "cascade", "authenticationType": "API_KEY"})
+    api_id = _json_mod.loads(resp[2])["graphqlApi"]["apiId"]
+    _appsync._start_schema_creation(api_id, {"definition": "type Query { hi: String }"})
+    _appsync._create_data_source(api_id, {"name": "DS", "type": "NONE"})
+    _appsync._create_function(api_id, {"name": "fn", "dataSourceName": "DS"})
+
+    assert api_id in _appsync._functions
+    assert api_id in _appsync._schemas
+
+    _appsync._delete_graphql_api(api_id)
+
+    assert api_id not in _appsync._functions, "functions leaked after DeleteGraphqlApi"
+    assert api_id not in _appsync._schemas, "schema leaked after DeleteGraphqlApi"
+    assert api_id not in _appsync._data_sources
+
+
+def test_appsync_update_preserves_creation_time(monkeypatch):
+    """An update must not restamp createdAt, as AWS does not.
+
+    _now() has whole-second granularity, so a create and an update in the same
+    second are indistinguishable; the clock is advanced between them.
+    """
+    import json as _json_mod
+
+    from ministack.services import appsync as _appsync
+
+    clock = {"t": 1_700_000_000}
+    monkeypatch.setattr(_appsync, "_now", lambda: clock["t"])
+
+    resp = _appsync._create_graphql_api({"name": "ctime", "authenticationType": "API_KEY"})
+    api_id = _json_mod.loads(resp[2])["graphqlApi"]["apiId"]
+    created = _json_mod.loads(
+        _appsync._create_data_source(api_id, {"name": "DS", "type": "NONE", "description": "one"})[2]
+    )["dataSource"]
+
+    clock["t"] += 3600
+    updated = _json_mod.loads(
+        _appsync._update_data_source(api_id, "DS", {"type": "NONE", "description": "two"})[2]
+    )["dataSource"]
+
+    assert updated["description"] == "two"
+    assert updated["createdAt"] == created["createdAt"], "createdAt was restamped by the update"
+    assert updated["lastUpdatedAt"] == clock["t"], "lastUpdatedAt should advance"
+
+
+def test_appsync_graphql_api_echoes_its_tags(appsync):
+    """The GraphqlApi object must carry `tags`.
+
+    AWS returns tags on the API itself, and that is where the Terraform provider
+    reads them. CreateGraphqlApi stored them in the ARN-keyed tag store but left
+    them off the record, so tags_all refreshed to empty and every plan proposed
+    the same tag change.
+    """
+    api = appsync.create_graphql_api(
+        name="qa-api-tags",
+        authenticationType="API_KEY",
+        tags={"ourco:env": "ministack"},
+    )["graphqlApi"]
+    assert api.get("tags") == {"ourco:env": "ministack"}
+
+    got = appsync.get_graphql_api(apiId=api["apiId"])["graphqlApi"]
+    assert got.get("tags") == {"ourco:env": "ministack"}
+
+    listed = [
+        a for a in appsync.list_graphql_apis()["graphqlApis"]
+        if a["apiId"] == api["apiId"]
+    ]
+    assert listed and listed[0].get("tags") == {"ourco:env": "ministack"}
+
+    # A tag added later through TagResource must show up on the API too.
+    appsync.tag_resource(resourceArn=api["arn"], tags={"team": "platform"})
+    got = appsync.get_graphql_api(apiId=api["apiId"])["graphqlApi"]
+    assert got["tags"]["team"] == "platform"
+    assert got["tags"]["ourco:env"] == "ministack"
+
+
+def _cache_api(appsync, name):
+    return appsync.create_graphql_api(name=name, authenticationType="API_KEY")[
+        "graphqlApi"
+    ]["apiId"]
+
+
+def test_appsync_api_cache_lifecycle(appsync):
+    """CreateApiCache / Get / Update / Flush / Delete.
+
+    aws_appsync_api_cache cannot be applied at all without these, so an
+    environment that enables caching in the cloud has to disable it locally and
+    silently diverges from the thing it is meant to reproduce.
+    """
+    api_id = _cache_api(appsync, "qa-cache-lifecycle")
+
+    created = appsync.create_api_cache(
+        apiId=api_id,
+        ttl=60,
+        apiCachingBehavior="PER_RESOLVER_CACHING",
+        type="SMALL",
+        atRestEncryptionEnabled=True,
+        transitEncryptionEnabled=True,
+    )["apiCache"]
+    assert created["ttl"] == 60
+    assert created["apiCachingBehavior"] == "PER_RESOLVER_CACHING"
+    assert created["type"] == "SMALL"
+    assert created["atRestEncryptionEnabled"] is True
+    assert created["transitEncryptionEnabled"] is True
+    assert created["status"] == "AVAILABLE"
+
+    got = appsync.get_api_cache(apiId=api_id)["apiCache"]
+    assert got == created
+
+    updated = appsync.update_api_cache(
+        apiId=api_id, ttl=300, apiCachingBehavior="FULL_REQUEST_CACHING", type="MEDIUM"
+    )["apiCache"]
+    assert updated["ttl"] == 300
+    assert updated["apiCachingBehavior"] == "FULL_REQUEST_CACHING"
+    assert updated["type"] == "MEDIUM"
+    # Encryption is set at create time and cannot be changed by an update; it
+    # must survive one rather than silently reverting to false.
+    assert updated["atRestEncryptionEnabled"] is True
+    assert updated["transitEncryptionEnabled"] is True
+
+    appsync.flush_api_cache(apiId=api_id)
+    assert appsync.get_api_cache(apiId=api_id)["apiCache"]["ttl"] == 300
+
+    appsync.delete_api_cache(apiId=api_id)
+    with pytest.raises(ClientError) as e:
+        appsync.get_api_cache(apiId=api_id)
+    assert e.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_appsync_api_cache_rejects_a_second_cache_and_unknown_apis(appsync):
+    """One cache per API, and the operations 404 on an API that does not exist."""
+    api_id = _cache_api(appsync, "qa-cache-errors")
+    appsync.create_api_cache(
+        apiId=api_id, ttl=60, apiCachingBehavior="PER_RESOLVER_CACHING", type="SMALL"
+    )
+
+    with pytest.raises(ClientError) as e:
+        appsync.create_api_cache(
+            apiId=api_id, ttl=60, apiCachingBehavior="PER_RESOLVER_CACHING", type="SMALL"
+        )
+    assert e.value.response["Error"]["Code"] == "BadRequestException"
+
+    for call in (
+        lambda: appsync.get_api_cache(apiId="doesnotexist"),
+        lambda: appsync.delete_api_cache(apiId="doesnotexist"),
+        lambda: appsync.flush_api_cache(apiId="doesnotexist"),
+    ):
+        with pytest.raises(ClientError) as e:
+            call()
+        assert e.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_appsync_deleting_an_api_releases_its_cache(appsync):
+    """A cache must not outlive its API — a later API reusing the id would
+    otherwise inherit a cache nobody created."""
+    api_id = _cache_api(appsync, "qa-cache-cascade")
+    appsync.create_api_cache(
+        apiId=api_id, ttl=60, apiCachingBehavior="PER_RESOLVER_CACHING", type="SMALL"
+    )
+    appsync.delete_graphql_api(apiId=api_id)
+
+    with pytest.raises(ClientError) as e:
+        appsync.get_api_cache(apiId=api_id)
+    assert e.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def _graphql(api_id, api_key, query):
+    """POST a query to the API's data plane the way an SDK would."""
+    import requests as _rq
+    r = _rq.post(f"{_ENDPOINT}/v1/apis/{api_id}/graphql",
+                 headers={"x-api-key": api_key, "content-type": "application/json"},
+                 json={"query": query}, timeout=15)
+    return r.json()
+
+def _cache_ds_api(appsync, ddb, name):
+    """An API with a DynamoDB-backed resolver, which is what ministack executes."""
+    api = appsync.create_graphql_api(name=name, authenticationType="API_KEY")["graphqlApi"]
+    api_id = api["apiId"]
+    key = appsync.create_api_key(apiId=api_id)["apiKey"]["id"]
+    table = f"{name}-table"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "id", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "id", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    appsync.create_data_source(
+        apiId=api_id, name="Things", type="AMAZON_DYNAMODB",
+        dynamodbConfig={"tableName": table, "awsRegion": "us-east-1"},
+    )
+    return api_id, key, table
+
+
+def test_appsync_caches_a_resolver_that_declares_a_ttl(appsync, ddb):
+    """A cached resolver must not re-read its datasource within the TTL.
+
+    An API can declare an ApiCache and per-resolver cachingConfig, and both
+    round-trip through the control plane, but the data plane ignored them: every
+    query re-ran the resolver. A caching bug — a stale read, a key collision —
+    could not be reproduced locally at all.
+    """
+    api_id, key, table = _cache_ds_api(appsync, ddb, "qa-cache-exec")
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="getThing", dataSourceName="Things",
+        cachingConfig={"ttl": 300, "cachingKeys": ["$context.arguments.id"]},
+    )
+    appsync.create_api_cache(
+        apiId=api_id, ttl=60, apiCachingBehavior="PER_RESOLVER_CACHING", type="SMALL")
+
+    ddb.put_item(TableName=table, Item={"id": {"S": "t1"}, "v": {"S": "first"}})
+    q = '{ getThing(id: "t1") { id v } }'
+    first = _graphql(api_id, key, q)
+    assert first["data"]["getThing"]["v"] == "first"
+
+    # Change the row underneath. A cached resolver must still answer "first".
+    ddb.put_item(TableName=table, Item={"id": {"S": "t1"}, "v": {"S": "second"}})
+    cached = _graphql(api_id, key, q)
+    assert cached["data"]["getThing"]["v"] == "first", "resolver was not cached"
+
+    # A different argument is a different entry and must see the new value.
+    ddb.put_item(TableName=table, Item={"id": {"S": "t2"}, "v": {"S": "other"}})
+    other = _graphql(api_id, key, '{ getThing(id: "t2") { id v } }')
+    assert other["data"]["getThing"]["v"] == "other", "caching keys must isolate entries"
+
+    # FlushApiCache drops it, so the next read sees the new value.
+    appsync.flush_api_cache(apiId=api_id)
+    assert _graphql(api_id, key, q)["data"]["getThing"]["v"] == "second"
+
+
+def test_appsync_does_not_cache_without_an_api_cache_or_a_ttl(appsync, ddb):
+    """No ApiCache means no caching, and under PER_RESOLVER_CACHING a resolver
+    that declares no ttl is not cached either — otherwise enabling the cache
+    would silently start serving stale data from resolvers that never asked."""
+    api_id, key, table = _cache_ds_api(appsync, ddb, "qa-cache-off")
+    appsync.create_resolver(
+        apiId=api_id, typeName="Query", fieldName="getThing", dataSourceName="Things")
+
+    ddb.put_item(TableName=table, Item={"id": {"S": "t1"}, "v": {"S": "first"}})
+    q = '{ getThing(id: "t1") { id v } }'
+    assert _graphql(api_id, key, q)["data"]["getThing"]["v"] == "first"
+    ddb.put_item(TableName=table, Item={"id": {"S": "t1"}, "v": {"S": "second"}})
+    # No cache on the API at all.
+    assert _graphql(api_id, key, q)["data"]["getThing"]["v"] == "second"
+
+    # Now add a cache, but the resolver still declares no ttl.
+    appsync.create_api_cache(
+        apiId=api_id, ttl=60, apiCachingBehavior="PER_RESOLVER_CACHING", type="SMALL")
+    ddb.put_item(TableName=table, Item={"id": {"S": "t1"}, "v": {"S": "third"}})
+    assert _graphql(api_id, key, q)["data"]["getThing"]["v"] == "third"
