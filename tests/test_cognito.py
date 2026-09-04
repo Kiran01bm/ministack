@@ -926,6 +926,77 @@ def test_cognito_identity_pool_roles(cognito_identity):
     assert roles["Roles"]["authenticated"] == "arn:aws:iam::000000000000:role/AuthRole"
     assert roles["Roles"]["unauthenticated"] == "arn:aws:iam::000000000000:role/UnauthRole"
 
+def test_cognito_identity_pool_principal_tags(cognito_identity):
+    """SetPrincipalTagAttributeMap stores a provider's attribute mapping and
+    GetPrincipalTagAttributeMap reports it back."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="PrincipalTagPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+
+    resp = cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid,
+        IdentityProviderName=provider,
+        UseDefaults=False,
+        PrincipalTags={"tenant": "custom:tenant"},
+    )
+    assert resp["IdentityPoolId"] == iid
+    assert resp["IdentityProviderName"] == provider
+    assert resp["UseDefaults"] is False
+    assert resp["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+    got = cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider)
+    assert got["UseDefaults"] is False
+    assert got["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+    # A second provider on the same pool keeps its own mapping.
+    other = "cognito-idp.us-east-1.amazonaws.com/us-east-1_other"
+    cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=other,
+        UseDefaults=False, PrincipalTags={"email": "email"})
+    assert cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider,
+    )["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+
+def test_cognito_identity_pool_principal_tags_unconfigured_provider(cognito_identity):
+    """A provider nobody has configured is not readable, and UseDefaults
+    round-trips without materializing a tag map."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="PrincipalTagDefaultsPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+
+    with pytest.raises(ClientError) as exc:
+        cognito_identity.get_principal_tag_attribute_map(
+            IdentityPoolId=iid, IdentityProviderName=provider)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["Error"]["Message"] == (
+        f"No Principal Tags configured for Provider {provider}")
+
+    # UseDefaults selects the mapping AWS applies when it vends credentials; it
+    # does not populate PrincipalTags. terraform-provider-aws sends both
+    # members together like this on destroy.
+    cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider,
+        UseDefaults=True, PrincipalTags={})
+    defaulted = cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider)
+    assert defaulted["UseDefaults"] is True
+    assert defaulted["PrincipalTags"] == {}
+
+
+def test_cognito_identity_pool_principal_tags_unknown_pool(cognito_identity):
+    with pytest.raises(ClientError) as exc:
+        cognito_identity.get_principal_tag_attribute_map(
+            IdentityPoolId="us-east-1:00000000-0000-0000-0000-000000000000",
+            IdentityProviderName="cognito-idp.us-east-1.amazonaws.com/us-east-1_example")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_cognito_list_identities(cognito_identity):
     resp = cognito_identity.create_identity_pool(
         IdentityPoolName="ListIdPool",
@@ -1433,6 +1504,19 @@ def test_cognito_force_change_password_challenge(cognito_idp):
     assert auth.get("ChallengeName") == "NEW_PASSWORD_REQUIRED"
     assert "Session" in auth
 
+def _totp_code(secret_b32: str) -> str:
+    """RFC 6238 code for the secret AssociateSoftwareToken returned —
+    HMAC-SHA1, 30-second step, 6 digits."""
+    import hashlib
+    import hmac
+    import struct
+
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8), casefold=True)
+    mac = hmac.new(key, struct.pack(">Q", int(time.time() // 30)), hashlib.sha1).digest()
+    offset = mac[-1] & 0x0F
+    return f"{(struct.unpack('>I', mac[offset:offset + 4])[0] & 0x7FFFFFFF) % 10**6:06d}"
+
+
 def test_cognito_totp_full_flow(cognito_idp):
     """Full TOTP MFA flow: SetUserPoolMfaConfig ON → AssociateSoftwareToken →
     VerifySoftwareToken → InitiateAuth returns SOFTWARE_TOKEN_MFA challenge →
@@ -1473,8 +1557,13 @@ def test_cognito_totp_full_flow(cognito_idp):
     assert "SecretCode" in assoc
     assert len(assoc["SecretCode"]) > 0
 
-    # Verify (accept any code)
-    verify = cognito_idp.verify_software_token(AccessToken=access_token, UserCode="123456")
+    # A wrong code is refused — that refusal is what an MFA test exists for.
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.verify_software_token(AccessToken=access_token, UserCode="000000")
+    assert exc.value.response["Error"]["Code"] == "EnableSoftwareTokenMFAException"
+
+    verify = cognito_idp.verify_software_token(
+        AccessToken=access_token, UserCode=_totp_code(assoc["SecretCode"]))
     assert verify["Status"] == "SUCCESS"
 
     # Now auth should return SOFTWARE_TOKEN_MFA challenge
@@ -1487,12 +1576,23 @@ def test_cognito_totp_full_flow(cognito_idp):
     assert auth2.get("ChallengeName") == "SOFTWARE_TOKEN_MFA"
     assert "Session" in auth2
 
-    # Respond with any TOTP code → get tokens
+    # A wrong challenge code is refused with CodeMismatchException.
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_respond_to_auth_challenge(
+            UserPoolId=pid,
+            ClientId=cid,
+            ChallengeName="SOFTWARE_TOKEN_MFA",
+            ChallengeResponses={"USERNAME": "totp-user", "SOFTWARE_TOKEN_MFA_CODE": "000000"},
+        )
+    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
+
+    # The correct code, derived from the enrolled secret, gets tokens.
     result = cognito_idp.admin_respond_to_auth_challenge(
         UserPoolId=pid,
         ClientId=cid,
         ChallengeName="SOFTWARE_TOKEN_MFA",
-        ChallengeResponses={"USERNAME": "totp-user", "SOFTWARE_TOKEN_MFA_CODE": "123456"},
+        ChallengeResponses={"USERNAME": "totp-user",
+                            "SOFTWARE_TOKEN_MFA_CODE": _totp_code(assoc["SecretCode"])},
     )
     assert "AuthenticationResult" in result
     assert "AccessToken" in result["AuthenticationResult"]
@@ -5332,7 +5432,7 @@ def test_cognito_unsigned_user_pool_operations_pin_the_owning_region():
     assert software_token["SecretCode"]
     assert west.verify_software_token(
         AccessToken=access_token,
-        UserCode="123456",
+        UserCode=_totp_code(software_token["SecretCode"]),
     )["Status"] == "SUCCESS"
     west.set_user_mfa_preference(
         AccessToken=access_token,
@@ -8071,3 +8171,34 @@ def test_cognito_prevent_user_existence_errors_masks_srp_challenge(cognito_idp):
 
     assert srp_failure("unknown@example.test") == (
         "NotAuthorizedException", "Incorrect username or password.")
+
+
+def test_cognito_identity_pool_credentials_are_sts_sessions(cognito_identity):
+    """Vended identity-pool credentials compose with the rest of the emulator:
+    GetCallerIdentity resolves them as the pool role assumed with the AWS
+    session name CognitoIdentityCredentials (previously they were unregistered,
+    so AUTH=true rejected them as an invalid security token)."""
+    import boto3
+
+    pool_id = cognito_identity.create_identity_pool(
+        IdentityPoolName="SessionPool", AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    cognito_identity.set_identity_pool_roles(
+        IdentityPoolId=pool_id,
+        Roles={"unauthenticated": "arn:aws:iam::000000000000:role/UnauthPoolRole"},
+    )
+    identity_id = cognito_identity.get_id(IdentityPoolId=pool_id)["IdentityId"]
+    creds = cognito_identity.get_credentials_for_identity(
+        IdentityId=identity_id)["Credentials"]
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    session_sts = boto3.client(
+        "sts", endpoint_url=endpoint, region_name="us-east-1",
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+    ident = session_sts.get_caller_identity()
+    assert ident["Arn"] == (
+        "arn:aws:sts::000000000000:assumed-role/UnauthPoolRole/CognitoIdentityCredentials")
+    assert ident["UserId"].endswith(":CognitoIdentityCredentials")

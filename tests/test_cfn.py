@@ -552,6 +552,63 @@ def test_cfn_iot_and_cognito_role_attachment(cfn, iot_client, cognito_identity):
     _wait_stack(cfn, "cfn-iot-cog")
 
 
+def test_cfn_cognito_identity_pool_principal_tag(cfn, cognito_identity):
+    """AWS::Cognito::IdentityPoolPrincipalTag provisions onto the identity pool,
+    is readable through GetPrincipalTagAttributeMap, and is cleared on delete."""
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+    replacement = "cognito-idp.us-east-1.amazonaws.com/us-east-1_replacement"
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Pool": {"Type": "AWS::Cognito::IdentityPool", "Properties": {
+                "IdentityPoolName": "cfn-tag-pool", "AllowUnauthenticatedIdentities": True}},
+            "Tags": {"Type": "AWS::Cognito::IdentityPoolPrincipalTag", "Properties": {
+                "IdentityPoolId": {"Ref": "Pool"},
+                "IdentityProviderName": provider,
+                "UseDefaults": False,
+                "PrincipalTags": {"tenant": "custom:tenant"}}},
+        },
+        "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}},
+                    "TagRef": {"Value": {"Ref": "Tags"}}},
+    }
+    cfn.create_stack(StackName="cfn-cog-tag", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-cog-tag")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}
+    pool_id = outputs["PoolId"]
+    # Ref is the documented primary identifier: "<pool id>|<provider name>".
+    assert outputs["TagRef"] == f"{pool_id}|{provider}"
+    mapping = cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=pool_id, IdentityProviderName=provider)
+    assert mapping["UseDefaults"] is False
+    assert mapping["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+    # A changed PrincipalTags applies in place.
+    template["Resources"]["Tags"]["Properties"]["PrincipalTags"] = {"email": "email"}
+    cfn.update_stack(StackName="cfn-cog-tag", TemplateBody=json.dumps(template))
+    assert _wait_stack(cfn, "cfn-cog-tag")["StackStatus"] == "UPDATE_COMPLETE"
+    assert cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=pool_id, IdentityProviderName=provider,
+    )["PrincipalTags"] == {"email": "email"}
+
+    # IdentityProviderName is create-only: the mapping moves to the new provider
+    # and the one it left goes inactive.
+    template["Resources"]["Tags"]["Properties"]["IdentityProviderName"] = replacement
+    cfn.update_stack(StackName="cfn-cog-tag", TemplateBody=json.dumps(template))
+    assert _wait_stack(cfn, "cfn-cog-tag")["StackStatus"] == "UPDATE_COMPLETE"
+    assert cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=pool_id, IdentityProviderName=replacement,
+    )["PrincipalTags"] == {"email": "email"}
+    with pytest.raises(ClientError) as exc:
+        cognito_identity.get_principal_tag_attribute_map(
+            IdentityPoolId=pool_id, IdentityProviderName=provider)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    cfn.delete_stack(StackName="cfn-cog-tag")
+    _wait_stack(cfn, "cfn-cog-tag")
+
+
 def test_cfn_iot_policy_document_update_applies_in_place(cfn, iot_client):
     """A changed PolicyDocument updates the policy instead of rolling the stack
     back: IoT stores a new default version and Ref keeps the same name."""
@@ -10791,3 +10848,51 @@ def test_cfn_update_iam_managed_policy_in_place(cfn, iam):
         assert document["Statement"][0]["Action"] == "s3:GetObject"
     finally:
         _delete_cfn_test_stack(cfn, stack_name)
+
+
+def test_cfn_stack_addressable_by_id_for_delete_and_update(cfn):
+    """Every StackName parameter accepts the unique stack ID; the CDK CLI
+    addresses stacks by ARN, so DeleteStack/UpdateStack must resolve it —
+    a missed DeleteStack returned 200 and deleted nothing."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Topic": {"Type": "AWS::SNS::Topic",
+                                "Properties": {"TopicName": "cfn-by-id-a"}}},
+    }
+    cfn.create_stack(StackName="cfn-by-id", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-by-id")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    stack_id = stack["StackId"]
+
+    template["Resources"]["Topic"]["Properties"]["TopicName"] = "cfn-by-id-b"
+    cfn.update_stack(StackName=stack_id, TemplateBody=json.dumps(template))
+    assert _wait_stack(cfn, "cfn-by-id")["StackStatus"] == "UPDATE_COMPLETE"
+
+    cfn.delete_stack(StackName=stack_id)
+    _wait_stack(cfn, "cfn-by-id")
+    described = cfn.describe_stacks(StackName=stack_id)["Stacks"]
+    assert described[0]["StackStatus"] == "DELETE_COMPLETE"
+
+
+def test_cfn_cognito_user_pool_enabled_mfas(cfn, cognito_idp):
+    """EnabledMfas (what CDK emits for mfaSecondFactor otp) maps onto the
+    software-token config block GetUserPoolMfaConfig reports."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Pool": {"Type": "AWS::Cognito::UserPool", "Properties": {
+            "UserPoolName": "cfn-enabled-mfas",
+            "MfaConfiguration": "OPTIONAL",
+            "EnabledMfas": ["SOFTWARE_TOKEN_MFA"]}}},
+        "Outputs": {"PoolId": {"Value": {"Ref": "Pool"}}},
+    }
+    cfn.create_stack(StackName="cfn-enabled-mfas", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-enabled-mfas")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+    pool_id = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["PoolId"]
+
+    cfg = cognito_idp.get_user_pool_mfa_config(UserPoolId=pool_id)
+    assert cfg["MfaConfiguration"] == "OPTIONAL"
+    assert cfg["SoftwareTokenMfaConfiguration"]["Enabled"] is True
+
+    cfn.delete_stack(StackName="cfn-enabled-mfas")
+    _wait_stack(cfn, "cfn-enabled-mfas")
